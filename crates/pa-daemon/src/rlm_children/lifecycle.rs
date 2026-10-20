@@ -487,6 +487,17 @@ impl SupervisorChildSessionsInner {
         if !idle {
             return;
         }
+        if std::env::var_os("PRIME_AGENT_RLM_SETTLE_TRACE").is_some() {
+            // Diagnostic trace (opt-in): the state snapshot a settle verdict rests on.
+            let child_id = record.lock().await.rlm_child_id.clone();
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis());
+            eprintln!(
+                "pa-daemon: RLM settle trace t={unix_ms} child {child_id} session {active_session_id}: state={}",
+                state.as_ref().map_or_else(|error| format!("<{error:#}>"), ToString::to_string)
+            );
+        }
         // Capture the answer before taking the record lock (the capture is
         // a link round trip): one fetch yields the raw text both lanes
         // derive from — the compact preview for the roster rows and the
