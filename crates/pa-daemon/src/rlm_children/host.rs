@@ -281,7 +281,15 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 if watcher_record.lock().await.closed_by_parent {
                     return;
                 }
-                watcher_record.lock().await.prompt_admitted = true;
+                // `prompt_admitted` flips only once the kickoff has been
+                // delivered (below): while the prompt is in flight — a
+                // routing retry, a durable wake that launches a fresh
+                // worker — the child's worker reads alive-but-idle, and
+                // `refresh_record` would score that as a `done` settle with
+                // the pre-prompt empty answer. Measured on a factory run:
+                // the parent's collect declared an orchestrator child done
+                // eight seconds before its first assistant turn, and the
+                // machine ended on an empty output capture.
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -326,6 +334,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         return;
                     }
                 }
+                watcher_record.lock().await.prompt_admitted = true;
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
