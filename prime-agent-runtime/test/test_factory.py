@@ -5580,6 +5580,54 @@ class FactoryExecutorTest(_ExecutorTestCase):
         self.assertEqual(status["usage"]["transitions_fired"], 2)
 
     @async_test
+    async def test_verbatim_json_strings_render_as_text_and_hidden_inputs_never_render(self) -> None:
+        # ``verbatim`` renders a json string as text (no quotes, no escapes),
+        # like a foreach item; the default stays the JSON literal. A hidden
+        # input is bound for the spawn options but reaches neither a
+        # placeholder nor the trailing ## Inputs section.
+        self.host.outcomes["a"] = {
+            "status": "done",
+            "answer": '```json\n{"note": "Avoid the \\"mines\\" door.", "secret": {"token": "t-1", "session_file": "/s/a.jsonl"}}\n```',
+        }
+        self.host.outcomes["b"] = {"status": "done", "answer": "ok"}
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "a",
+                        "entry": True,
+                        "subagent": "worker",
+                        "outputs": [{"name": "note", "type": "json"}, {"name": "secret", "type": "json"}],
+                    },
+                    {
+                        "id": "b",
+                        "subagent": {
+                            "prompt": "Directive: {note}",
+                            "fork_from": {"input": "secret", "path": "session_file"},
+                        },
+                        "inputs": [
+                            {"name": "note", "type": "json", "from": "a.note", "verbatim": True},
+                            {"name": "secret", "type": "json", "from": "a.secret", "hidden": True},
+                        ],
+                    },
+                ],
+                "transitions": [{"from": "a", "to": "b"}],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        call = self.host.spawn_calls("b")[0]
+        self.assertEqual(call["prompt"], 'Directive: Avoid the "mines" door.')
+        self.assertNotIn("## Inputs", call["prompt"])
+        self.assertNotIn("t-1", call["prompt"])
+        self.assertEqual(call["kwargs"]["fork_from"], {"session_file": "/s/a.jsonl"})
+        self.assertEqual(
+            validate_factory_machine({"states": [{"id": "a", "entry": True, "subagent": "w", "outputs": [{"name": "o", "type": "json"}]}, {"id": "b", "subagent": "w", "inputs": [{"name": "o", "type": "json", "from": "a.o", "hidden": "yes"}]}], "transitions": []}),
+            ["state b input 'o' hidden must be a boolean when provided"],
+        )
+
+    @async_test
     async def test_machine_fork_from_self_copies_the_previous_childs_session(self) -> None:
         # A looping state keeps its memory: every re-entry's child starts
         # from a copy of the previous settled child's session file. The

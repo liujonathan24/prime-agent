@@ -415,6 +415,9 @@ def _validate_state_fields(
         optional = inp.get("optional")
         if optional is not None and not isinstance(optional, bool):
             errors.append(f"{noun} {ref} input {name!r} optional must be a boolean when provided")
+        for flag in ("hidden", "verbatim"):
+            if inp.get(flag) is not None and not isinstance(inp.get(flag), bool):
+                errors.append(f"{noun} {ref} input {name!r} {flag} must be a boolean when provided")
         if not _is_nonempty_str(name):
             errors.append(f"{noun} {ref} inputs[{index}] requires a non-empty name")
         elif name in seen_input_names:
@@ -2842,7 +2845,14 @@ class FactoryExecutor:
                     return None, f"foreach.over input {name!r} is not a JSON list"
                 items = value
                 continue
-            values[name] = json.dumps(value)
+            # ``"verbatim": true`` renders a json STRING as text, the way a
+            # foreach item renders: a prompt that reads {directive} sees the
+            # words, not a quoted, escaped JSON literal. Everything else, and
+            # the default, renders as JSON.
+            if inp.get("verbatim") is True and isinstance(value, str):
+                values[name] = value
+            else:
+                values[name] = json.dumps(value)
         # The spawn options bind from the same inputs as the prompt (one
         # resolution per entry; foreach instances share it). A wrong shape
         # is a deterministic binding failure, like a bad port.
@@ -2852,11 +2862,17 @@ class FactoryExecutor:
         mcp_servers, option_error = self._resolve_mcp_servers(state, values)
         if option_error is not None:
             return None, option_error
+        # A hidden input binds (the spawn options read it) but never
+        # reaches the prompt: not as a placeholder, not in the trailing
+        # ``## Inputs`` section. The player of a checkpoint machine must not
+        # see the session paths, the restore handle, or a server token.
+        hidden = {inp["name"] for inp in state.spec.get("inputs") or [] if inp.get("hidden") is True}
+        visible = {name: value for name, value in values.items() if name not in hidden}
         if foreach is None:
             assert state.prompt_template is not None
             instance = _NodeInstance(
                 index=state.instance_counter,
-                prompt=_render_prompt(state.prompt_template, values),
+                prompt=_render_prompt(state.prompt_template, visible),
                 fork_from=fork_from,
                 mcp_servers=mcp_servers,
             )
@@ -2870,7 +2886,7 @@ class FactoryExecutor:
             instances.append(
                 _NodeInstance(
                     index=state.instance_counter + len(instances),
-                    prompt=_render_prompt(state.prompt_template, {**values, foreach["over"]: instance_value}),
+                    prompt=_render_prompt(state.prompt_template, {**visible, foreach["over"]: instance_value}),
                     fork_from=fork_from,
                     mcp_servers=mcp_servers,
                 )
@@ -5216,7 +5232,11 @@ the cap, fails to capture, and fails the producing state through its
   `"from": "<state_id>.<output_name>"`; types must match, duplicates are
   rejected, and nothing can read from a resident. Bound values render into
   `{input_name}` placeholders (one pass; inputs without a placeholder are
-  appended in a trailing `## Inputs` section). A required input whose source
+  appended in a trailing `## Inputs` section). Two input flags shape the
+  rendering: `"verbatim": true` renders a json STRING as text (the way a
+  foreach item renders; the default is the JSON literal), and
+  `"hidden": true` binds the input (the spawn options can read it) but
+  never renders it, not as a placeholder and not in the trailing section. A required input whose source
   has not settled yet keeps the entry pending; over a settled source that
   offers no value (an errored settle, or a settle that captured nothing for
   the port) it fails the dependent entry, while
