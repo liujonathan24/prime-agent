@@ -12,6 +12,15 @@ use super::{
     WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS,
 };
 
+/// Where a created child's session file comes from.
+pub(super) enum ChildSessionSource {
+    /// A new, empty session file (the default).
+    Fresh,
+    /// An already-written copy of another session (`rlm.spawn`'s
+    /// `fork_from`): the worker opens and resumes this file.
+    Forked(std::path::PathBuf),
+}
+
 /// Parsed ids of one created child session.
 struct CreatedSessionIds {
     active_session_id: String,
@@ -81,6 +90,7 @@ impl SupervisorChildSessionsInner {
         runtime_metadata: Option<Value>,
         identity: &ParentIdentity,
         launch_env: Option<std::collections::BTreeMap<String, String>>,
+        session_source: &ChildSessionSource,
     ) -> Result<CreatedChild> {
         let mut config = json!({
             "cwd": cwd,
@@ -130,9 +140,15 @@ impl SupervisorChildSessionsInner {
             }
             metadata
         });
+        // A forked child opens its copied file (the worker's `sessionPath`
+        // resume arm); the config's `rlmDepth` still wins over the header.
+        let session_path = match session_source {
+            ChildSessionSource::Fresh => None,
+            ChildSessionSource::Forked(path) => Some(path.to_string_lossy().to_string()),
+        };
         let create = DaemonCommand::Create {
             id: None,
-            session_path: None,
+            session_path,
             continue_recent: None,
             no_session: None,
             name: name.map(str::to_string),
@@ -185,6 +201,7 @@ impl SupervisorChildSessionsInner {
                 runtime_metadata,
                 identity,
                 launch_env,
+                &ChildSessionSource::Fresh,
             )
             .await?;
         // A failed prompt tears the just-created session down (TS kills the
@@ -199,6 +216,33 @@ impl SupervisorChildSessionsInner {
             return Err(error);
         }
         Ok(created)
+    }
+
+    /// Install session-scoped MCP servers on a just-created child (the
+    /// `replace_acp_mcp_servers` arm, before the task prompt so the child
+    /// is never busy): `rlm.spawn`'s `mcp_servers`.
+    pub(super) async fn replace_child_mcp_servers(
+        &self,
+        active_session_id: &str,
+        owner_id: &str,
+        servers: &[pa_core::mcp::AcpMcpServerConfig],
+    ) -> Result<()> {
+        let command = DaemonCommand::ReplaceAcpMcpServers {
+            id: None,
+            active_session_id: active_session_id.to_string(),
+            owner_id: owner_id.to_string(),
+            servers: serde_json::to_value(servers).context("serialize child MCP servers")?,
+            rest: Map::default(),
+        };
+        self.command(&command, STATE_TIMEOUT_MS)
+            .await
+            .with_context(|| {
+                format!(
+                    "install {} MCP server(s) on RLM child session {active_session_id}",
+                    servers.len()
+                )
+            })?;
+        Ok(())
     }
 
     /// Parse a created-session summary into its ids.

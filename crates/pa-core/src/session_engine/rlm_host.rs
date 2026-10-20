@@ -40,6 +40,10 @@ pub struct RlmSpawnHandle {
     pub name: String,
     pub session_dir: String,
     pub model: String,
+    /// The child's session file when the host persisted one; a later
+    /// spawn's `fork_from` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
 }
 
 /// `rlm.create_session` handle: one resident depth-0 daemon session.
@@ -133,6 +137,16 @@ pub struct RlmChildResult {
 
 // Requests into the host
 
+/// The session file a spawned child starts from: a whole-file copy, or
+/// the branch cut at `entry_id` (`SessionFile::create_branched_file`).
+/// The copy lands in the child's own session dir; the source is never
+/// written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkSource {
+    pub session_file: String,
+    pub entry_id: Option<String>,
+}
+
 /// Validated `rlm.spawn` request handed to the child-session host.
 #[derive(Debug, Clone)]
 pub struct RlmSpawnRequest {
@@ -146,6 +160,12 @@ pub struct RlmSpawnRequest {
     /// The parent's in-flight turn request the spawn anchors to (TS
     /// `spawnedByRequestId`): `None` for a spawn outside an active run.
     pub spawned_by_request_id: Option<String>,
+    /// Start the child from a copy of an existing session instead of an
+    /// empty one (`None`: the fresh-session default).
+    pub fork_from: Option<ForkSource>,
+    /// Session-scoped MCP servers installed on the child before its task
+    /// prompt (`None`: the child sees only the parent's configured servers).
+    pub mcp_servers: Option<Vec<crate::mcp::AcpMcpServerConfig>>,
 }
 
 /// Validated `rlm.create_session` request handed to the host.
@@ -644,7 +664,11 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
 fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmSpawnRequest> {
     const OPERATION: &str = "rlm.spawn";
     let kwargs = kwargs_from_payload(data);
-    reject_unsupported_kwargs(&kwargs, OPERATION, &["name", "model", "thinking"])?;
+    reject_unsupported_kwargs(
+        &kwargs,
+        OPERATION,
+        &["name", "model", "thinking", "fork_from", "mcp_servers"],
+    )?;
     let name = optional_string_kwarg(&kwargs, "name", OPERATION)?;
     let name = normalize_requested_rlm_subagent_session_name(name, OPERATION)?;
     if let Some(name) = &name {
@@ -655,13 +679,78 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
     let thinking = optional_string_kwarg(&kwargs, "thinking", OPERATION)?;
     let thinking =
         normalize_requested_rlm_subagent_thinking_level(thinking, OPERATION)?.map(String::from);
+    let fork_from = fork_source_kwarg(&kwargs, OPERATION)?;
+    let mcp_servers = mcp_servers_kwarg(&kwargs, OPERATION)?;
     Ok(RlmSpawnRequest {
         prompt: prompt.to_string(),
         name,
         model,
         thinking,
         spawned_by_request_id: None,
+        fork_from,
+        mcp_servers,
     })
+}
+
+/// `fork_from`: a session file path, or `{"session_file", "entry_id"?}`.
+fn fork_source_kwarg(
+    kwargs: &Map<String, Value>,
+    operation: &str,
+) -> anyhow::Result<Option<ForkSource>> {
+    match kwargs.get("fork_from") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(path)) => {
+            if path.trim().is_empty() {
+                anyhow::bail!("{operation} fork_from must be a non-empty session file path");
+            }
+            Ok(Some(ForkSource {
+                session_file: path.clone(),
+                entry_id: None,
+            }))
+        }
+        Some(Value::Object(object)) => {
+            let session_file = match object.get("session_file") {
+                Some(Value::String(path)) if !path.trim().is_empty() => path.clone(),
+                _ => anyhow::bail!("{operation} fork_from.session_file must be a non-empty string"),
+            };
+            let entry_id = match object.get("entry_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
+                Some(_) => {
+                    anyhow::bail!(
+                        "{operation} fork_from.entry_id must be a non-empty string when given"
+                    )
+                }
+            };
+            Ok(Some(ForkSource {
+                session_file,
+                entry_id,
+            }))
+        }
+        Some(_) => anyhow::bail!(
+            "{operation} fork_from must be a session file path or an object with session_file \
+             and an optional entry_id"
+        ),
+    }
+}
+
+/// `mcp_servers`: a list of session-scoped server objects (the
+/// `replace_acp_mcp_servers` shape).
+fn mcp_servers_kwarg(
+    kwargs: &Map<String, Value>,
+    operation: &str,
+) -> anyhow::Result<Option<Vec<crate::mcp::AcpMcpServerConfig>>> {
+    match kwargs.get("mcp_servers") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value @ Value::Array(_)) => {
+            let servers: Vec<crate::mcp::AcpMcpServerConfig> =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    anyhow::anyhow!("{operation} mcp_servers is not a valid server list: {error}")
+                })?;
+            Ok(Some(servers))
+        }
+        Some(_) => anyhow::bail!("{operation} mcp_servers must be a list of server objects"),
+    }
 }
 
 fn register_create_session(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>) {
@@ -917,6 +1006,7 @@ mod tests {
                     name: "worker".into(),
                     session_dir: "/tmp/sub-1".into(),
                     model: "p/m".into(),
+                    session_file: None,
                 })
             })
         }
@@ -1380,6 +1470,118 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.to_string(), "rlm.spawn name must be a string");
+    }
+
+    #[tokio::test]
+    async fn spawn_fork_from_and_mcp_servers_kwargs_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = RecordingHost::new();
+        let spawn_requests = Arc::clone(&host.spawn_requests);
+        let wiring = wired(dir.path(), Some(host));
+        // The whole-file form: a bare path.
+        call(
+            &wiring,
+            "rlm.run",
+            json!({
+                "prompt": "resume",
+                "kwargs": { "name": "player", "fork_from": "/archive/c7/player.jsonl" }
+            }),
+        )
+        .await
+        .unwrap();
+        // The entry-cut form plus the child's own MCP servers.
+        call(
+            &wiring,
+            "rlm.run",
+            json!({
+                "prompt": "resume",
+                "kwargs": {
+                    "name": "player-2",
+                    "fork_from": { "session_file": "/archive/c8/player.jsonl", "entry_id": "e42" },
+                    "mcp_servers": [{
+                        "type": "http",
+                        "name": "game",
+                        "url": "http://game.local/mcp",
+                        "headers": { "Authorization": "Bearer t1" }
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let requests = spawn_requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].fork_from,
+            Some(ForkSource {
+                session_file: "/archive/c7/player.jsonl".into(),
+                entry_id: None,
+            })
+        );
+        assert_eq!(requests[0].mcp_servers, None);
+        assert_eq!(
+            requests[1].fork_from,
+            Some(ForkSource {
+                session_file: "/archive/c8/player.jsonl".into(),
+                entry_id: Some("e42".into()),
+            })
+        );
+        assert_eq!(
+            requests[1].mcp_servers,
+            Some(vec![crate::mcp::AcpMcpServerConfig::Http {
+                name: "game".into(),
+                url: "http://game.local/mcp".into(),
+                headers: std::collections::HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer t1".to_string()
+                )]),
+            }])
+        );
+        drop(requests);
+
+        // Validation: each malformed shape fails before the host sees it.
+        for (kwargs, message) in [
+            (
+                json!({ "name": "n", "fork_from": 5 }),
+                "rlm.spawn fork_from must be a session file path or an object with session_file and an optional entry_id",
+            ),
+            (
+                json!({ "name": "n", "fork_from": "  " }),
+                "rlm.spawn fork_from must be a non-empty session file path",
+            ),
+            (
+                json!({ "name": "n", "fork_from": { "entry_id": "e1" } }),
+                "rlm.spawn fork_from.session_file must be a non-empty string",
+            ),
+            (
+                json!({ "name": "n", "fork_from": { "session_file": "/a.jsonl", "entry_id": 3 } }),
+                "rlm.spawn fork_from.entry_id must be a non-empty string when given",
+            ),
+            (
+                json!({ "name": "n", "mcp_servers": "game" }),
+                "rlm.spawn mcp_servers must be a list of server objects",
+            ),
+        ] {
+            let error = call(&wiring, "rlm.run", json!({ "prompt": "p", "kwargs": kwargs }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+        let error = call(
+            &wiring,
+            "rlm.run",
+            json!({ "prompt": "p", "kwargs": { "name": "n", "mcp_servers": [{ "type": "carrier-pigeon" }] } }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("rlm.spawn mcp_servers is not a valid server list:"),
+            "{error}"
+        );
+        let requests = spawn_requests.lock().await;
+        assert_eq!(requests.len(), 2, "no malformed request reached the host");
     }
 
     #[tokio::test]

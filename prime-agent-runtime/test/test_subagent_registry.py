@@ -94,6 +94,65 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(result.name, "api-reviewer")
         self.assertEqual(result.model, "deepseek/deepseek-v4-flash")
 
+    def test_forwards_fork_from_and_mcp_servers_to_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "rlm_child_id": "sub-a1b2c3d4",
+                "name": "player",
+                "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                "model": "p/m",
+                "session_file": "/tmp/parent/sub-a1b2c3d4/sess.jsonl",
+            }
+        )
+        servers = [{"type": "http", "name": "game", "url": "http://game.local/mcp", "headers": {}}]
+
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(
+                rlm_module.rlm.spawn(
+                    "resume the game",
+                    name="player",
+                    fork_from={"session_file": Path("/archive/c7.jsonl"), "entry_id": "e42"},
+                    mcp_servers=servers,
+                )
+            )
+        host_request.assert_awaited_once_with(
+            "rlm.run",
+            {
+                "prompt": "resume the game",
+                "kwargs": {
+                    "name": "player",
+                    "fork_from": {"session_file": "/archive/c7.jsonl", "entry_id": "e42"},
+                    "mcp_servers": servers,
+                },
+            },
+        )
+        self.assertEqual(result.session_file, Path("/tmp/parent/sub-a1b2c3d4/sess.jsonl"))
+
+        # A bare path (str or Path) is the whole-file form.
+        host_request.reset_mock()
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.rlm.spawn("p", name="n", fork_from=Path("/archive/c8.jsonl")))
+        self.assertEqual(
+            host_request.await_args.args[1]["kwargs"]["fork_from"], {"session_file": "/archive/c8.jsonl"}
+        )
+        # A handle without a reported file keeps None.
+        host_request.return_value.pop("session_file")
+        with patch.object(rlm_module, "host_request", host_request):
+            plain = asyncio.run(rlm_module.rlm.spawn("p", name="n2"))
+        self.assertIsNone(plain.session_file)
+
+    def test_rejects_malformed_fork_from_and_mcp_servers_before_the_host(self) -> None:
+        host_request = AsyncMock()
+        bad_forks = ["", {"entry_id": "e1"}, {"session_file": "/a.jsonl", "entry_id": ""}, 42]
+        with patch.object(rlm_module, "host_request", host_request):
+            for bad in bad_forks:
+                with self.assertRaises(TypeError, msg=repr(bad)):
+                    asyncio.run(rlm_module.rlm.spawn("p", name="n", fork_from=bad))
+            for bad_servers in ("game", [{"type": "http"}, "game"]):
+                with self.assertRaises(TypeError, msg=repr(bad_servers)):
+                    asyncio.run(rlm_module.rlm.spawn("p", name="n", mcp_servers=bad_servers))
+        host_request.assert_not_awaited()
+
     def test_requires_an_explicit_child_name(self) -> None:
         host_request = AsyncMock()
         with patch.object(rlm_module, "host_request", host_request):

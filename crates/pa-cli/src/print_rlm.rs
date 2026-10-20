@@ -770,6 +770,7 @@ impl RlmSubagentHost for InlineHost {
                 name,
                 session_dir: child_node.session_dir.clone(),
                 model: selector,
+                session_file: None,
             })
         })
     }
@@ -1191,6 +1192,8 @@ mod tests {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         });
         std::future::poll_fn(|context| {
             assert!(spawn.as_mut().poll(context).is_pending());

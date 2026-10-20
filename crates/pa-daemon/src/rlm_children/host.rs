@@ -2,6 +2,7 @@
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
+use super::lifecycle::ChildSessionSource;
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
@@ -12,6 +13,8 @@ use super::{
     SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
     RENAME_TIMEOUT_MS,
 };
+use anyhow::anyhow;
+use pa_core::session_engine::rlm_host::ForkSource;
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
 /// the typed error and the `model refused` event; the settings read runs on the blocking pool.
@@ -122,6 +125,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
+                // A forked child's copy is written before the worker exists,
+                // so a bad source fails the spawn with nothing to tear down.
+                let session_source = match &request.fork_from {
+                    None => ChildSessionSource::Fresh,
+                    Some(source) => ChildSessionSource::Forked(
+                        fork_child_session(source, Path::new(&cwd), &child_dir).await?,
+                    ),
+                };
                 let runtime_metadata = json!({
                     "kind": "subagent",
                     "rlmChildId": child_id,
@@ -148,8 +159,28 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         // process, so the spawn forwards the parent
                         // worker's env (filtered) instead.
                         Some(pa_types::daemon::launch_env::collect_process_launch_env()),
+                        &session_source,
                     )
                     .await?;
+                // The child's own MCP servers go in before its task prompt
+                // (the worker refuses a replacement while the agent runs);
+                // a failed install tears the created session down like a
+                // failed prompt does.
+                if let Some(servers) = &request.mcp_servers {
+                    if let Err(error) = this
+                        .replace_child_mcp_servers(
+                            &created.active_session_id,
+                            &format!("rlm-spawn:{child_id}"),
+                            servers,
+                        )
+                        .await
+                    {
+                        let _ = this
+                            .kill_child(&created.active_session_id, ChildCloseReason::Killed)
+                            .await;
+                        return Err(error);
+                    }
+                }
                 let record = ChildRecord {
                     rlm_child_id: child_id.clone(),
                     session_name: created.session_name.clone().unwrap_or_else(|| name.clone()),
@@ -302,6 +333,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 name,
                 session_dir: created.session_dir,
                 model,
+                session_file: created.session_file,
             })
         })
     }
@@ -744,4 +776,53 @@ fn session_file_carries_spawn_kickoff(session_file: Option<&str>, spawn_row_id: 
                     == Some(pa_core::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE)
                 && entry.pointer("/details/id").and_then(Value::as_str) == Some(spawn_row_id)
         })
+}
+
+/// Write the fork source's copy into `child_dir` off the executor (both
+/// copies are synchronous file I/O): the whole file through
+/// `SessionManager::fork_from`, or the branch up to `entry_id` through
+/// `SessionFile::create_branched_file`. The copy records the parent's cwd
+/// and carries the source path as `parentSession`; `rlmDepth` is set by
+/// the create config, not the copied header.
+async fn fork_child_session(
+    source: &ForkSource,
+    cwd: &Path,
+    child_dir: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let source = source.clone();
+    let cwd = cwd.to_path_buf();
+    let child_dir = child_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<std::path::PathBuf> {
+        let session_file = Path::new(&source.session_file);
+        if !session_file.is_file() {
+            bail!(
+                "fork_from session file does not exist: {}",
+                session_file.display()
+            );
+        }
+        match &source.entry_id {
+            None => {
+                let forked = pa_core::session::manager::SessionManager::fork_from(
+                    session_file,
+                    &cwd,
+                    &child_dir,
+                )
+                .map_err(anyhow::Error::msg)?;
+                forked
+                    .get_session_file()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| anyhow!("forked session has no session file"))
+            }
+            Some(entry_id) => {
+                let store = crate::session_store::SessionFile::open(session_file)
+                    .with_context(|| format!("open fork source {}", session_file.display()))?;
+                let forked = store
+                    .create_branched_file(entry_id, &child_dir)
+                    .with_context(|| format!("fork at entry {entry_id}"))?;
+                Ok(forked.path)
+            }
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)?
 }

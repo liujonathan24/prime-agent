@@ -1983,6 +1983,67 @@ class ValidateFactoryMachineTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+    def test_inline_subagent_fork_from_and_mcp_servers_rules(self) -> None:
+        def machine(**subagent: Any) -> dict[str, Any]:
+            return {
+                "states": [
+                    state("a", entry=True, outputs=[{"name": "decision", "type": "json"}, {"name": "note", "type": "text"}]),
+                    {
+                        "id": "b",
+                        "subagent": {"prompt": "Play on.", **subagent},
+                        "inputs": [
+                            {"name": "decision", "type": "json", "from": "a.decision"},
+                            {"name": "note", "type": "text", "from": "a.note"},
+                        ],
+                    },
+                ],
+                "transitions": [{"from": "a", "to": "b"}],
+            }
+
+        # The two accepted forms, on a json input.
+        self.assertEqual(validate_factory_machine(machine(fork_from="self")), [])
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"input": "decision", "path": "next.session_ref"})), []
+        )
+        self.assertEqual(validate_factory_machine(machine(fork_from={"input": "decision"})), [])
+        self.assertEqual(
+            validate_factory_machine(machine(mcp_servers={"input": "decision", "path": "next.mcp_servers"})), []
+        )
+        # A text input captures the whole answer: no path can resolve into it.
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"input": "note", "path": "x"})),
+            ["state b inline subagent fork_from.input 'note' must have type 'json'"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"input": "ghost"})),
+            ["state b inline subagent fork_from.input must name one of this state's inputs, got 'ghost'"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(mcp_servers="self")),
+            ["state b inline subagent mcp_servers does not accept 'self'"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from=None)),
+            ["state b inline subagent fork_from must not be null; omit the key instead"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from=["decision"])),
+            ["state b inline subagent fork_from must be 'self' or an object {input, path}"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(mcp_servers={"input": "decision", "path": 7, "when": 1})),
+            [
+                "state b inline subagent mcp_servers has unsupported keys ['when']",
+                "state b inline subagent mcp_servers.path must be a non-empty dotted path when provided",
+            ],
+        )
+        # The options ride canonicalization verbatim (the executor reads them
+        # from the canonical subagent object).
+        canonical = canonicalize_factory_spec(machine(fork_from="self", mcp_servers={"input": "decision"}))
+        self.assertEqual(canonical["states"][1]["subagent"]["fork_from"], "self")
+        self.assertEqual(canonical["states"][1]["subagent"]["mcp_servers"], {"input": "decision"})
+
+
 class CompileFactoryDagTest(unittest.TestCase):
     def test_chain_compiles(self) -> None:
         dag = {
@@ -2881,6 +2942,9 @@ class FakeHost:
                 "name": name,
                 "session_dir": f"/tmp/{child_id}",
                 "model": "fake-model",
+                # The real host reports the persisted child's session file;
+                # a later ``fork_from: "self"`` names it.
+                "session_file": f"/tmp/{child_id}/{child_id}.jsonl",
             }
         self.calls.append((request_type, payload))
         if request_type == "rlm.collect":
@@ -5514,6 +5578,132 @@ class FactoryExecutorTest(_ExecutorTestCase):
         self.assertEqual(tick["entries_used"], 3)
         self.assertEqual(len(self.host.spawn_calls("tick")), 3)
         self.assertEqual(status["usage"]["transitions_fired"], 2)
+
+    @async_test
+    async def test_machine_fork_from_self_copies_the_previous_childs_session(self) -> None:
+        # A looping state keeps its memory: every re-entry's child starts
+        # from a copy of the previous settled child's session file. The
+        # first entry has no settle to copy and starts fresh.
+        for index in (1, 2, 3):
+            self.host.child_outcomes[f"child-{index}"] = {
+                "status": "done",
+                "answer": f'```json\n{{"count": {{"value": {index}}}}}\n```',
+            }
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "tick",
+                        "entry": True,
+                        "subagent": {"prompt": "Tick once more.", "fork_from": "self"},
+                        "max_entries": 4,
+                        "outputs": [{"name": "count", "type": "json"}],
+                    }
+                ],
+                "transitions": [
+                    {"from": "tick", "to": "tick", "when": {"output": "count", "path": "value", "op": "lt", "value": 3}},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        kwargs = [call["kwargs"] for call in self.host.spawn_calls("tick")]
+        self.assertEqual(len(kwargs), 3)
+        self.assertNotIn("fork_from", kwargs[0])
+        # The kernel API normalizes a bare path to the wire object.
+        self.assertEqual(kwargs[1]["fork_from"], {"session_file": "/tmp/child-1/child-1.jsonl"})
+        self.assertEqual(kwargs[2]["fork_from"], {"session_file": "/tmp/child-2/child-2.jsonl"})
+        self.assertNotIn("mcp_servers", kwargs[1])
+        # The status rows carry each child's file and its fork source, and
+        # the spawned events carry the source too.
+        instances = self.state_report(status, "tick")["instances"]
+        self.assertEqual(
+            [(row["session_file"], row["forked_from"]) for row in instances],
+            [
+                ("/tmp/child-1/child-1.jsonl", None),
+                ("/tmp/child-2/child-2.jsonl", "/tmp/child-1/child-1.jsonl"),
+                ("/tmp/child-3/child-3.jsonl", "/tmp/child-2/child-2.jsonl"),
+            ],
+        )
+        spawned = [event for event in status["events"] if event["kind"] == "spawned"]
+        self.assertEqual(
+            [event.get("forked_from") for event in spawned],
+            [None, "/tmp/child-1/child-1.jsonl", "/tmp/child-2/child-2.jsonl"],
+        )
+
+    @async_test
+    async def test_machine_fork_from_input_path_binds_the_source_and_mcp_servers(self) -> None:
+        # The orchestrator/player shape: the orchestrator's json decision
+        # names the player's session source and its own MCP servers; the
+        # player spawns with both. A null along the path starts fresh, and
+        # a wrong shape is a binding failure like a bad port.
+        servers = [{"type": "http", "name": "game", "url": "http://game.local/mcp", "headers": {"Authorization": "Bearer t1"}}]
+        decision = {
+            "next": {
+                "session_ref": {"session_file": "/archive/c7/player.jsonl", "entry_id": "e42"},
+                "mcp_servers": servers,
+                "directive": "descend carefully",
+                "bad_ref": 17,
+            }
+        }
+        self.host.outcomes["orchestrator"] = {"status": "done", "answer": "```json\n" + json.dumps({"decision": decision}) + "\n```"}
+        self.host.outcomes["player"] = {"status": "done", "answer": "played"}
+        self.host.outcomes["fresh"] = {"status": "done", "answer": "fresh"}
+        self.host.outcomes["broken"] = {"status": "done", "answer": "never"}
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {
+                        "id": "orchestrator",
+                        "entry": True,
+                        "subagent": {"prompt": "Pick a checkpoint."},
+                        "outputs": [{"name": "decision", "type": "json"}],
+                    },
+                    {
+                        "id": "player",
+                        "subagent": {
+                            "prompt": "Resume: {decision}",
+                            "fork_from": {"input": "decision", "path": "next.session_ref"},
+                            "mcp_servers": {"input": "decision", "path": "next.mcp_servers"},
+                        },
+                        "inputs": [{"name": "decision", "type": "json", "from": "orchestrator.decision"}],
+                    },
+                    {
+                        "id": "fresh",
+                        "subagent": {"prompt": "Start over.", "fork_from": {"input": "decision", "path": "next.absent.deeper"}},
+                        "inputs": [{"name": "decision", "type": "json", "from": "orchestrator.decision"}],
+                    },
+                    {
+                        "id": "broken",
+                        "subagent": {"prompt": "Never spawns.", "fork_from": {"input": "decision", "path": "next.bad_ref"}},
+                        "inputs": [{"name": "decision", "type": "json", "from": "orchestrator.decision"}],
+                    },
+                ],
+                "transitions": [
+                    {"from": "orchestrator", "to": "player", "when": {"output": "decision", "path": "next", "op": "exists"}},
+                    {"from": "orchestrator", "to": "fresh"},
+                    {"from": "orchestrator", "to": "broken"},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        player_kwargs = self.host.spawn_calls("player")[0]["kwargs"]
+        self.assertEqual(player_kwargs["fork_from"], {"session_file": "/archive/c7/player.jsonl", "entry_id": "e42"})
+        self.assertEqual(player_kwargs["mcp_servers"], servers)
+        fresh_kwargs = self.host.spawn_calls("fresh")[0]["kwargs"]
+        self.assertNotIn("fork_from", fresh_kwargs)
+        self.assertNotIn("mcp_servers", fresh_kwargs)
+        self.assertEqual(self.host.spawn_calls("broken"), [])
+        broken = self.state_report(status, "broken")
+        self.assertEqual(broken["status"], "error")
+        self.assertIn("fork_from resolved to int; expected a session file path", broken["entries"][0]["error"])
+        self.assertEqual(self.state_report(status, "player")["status"], "done")
+        spawned = next(event for event in status["events"] if event["kind"] == "spawned" and event["node"] == "player")
+        self.assertEqual(spawned["forked_from"], {"session_file": "/archive/c7/player.jsonl", "entry_id": "e42"})
+        self.assertEqual(spawned["mcp_servers"], ["game"])
 
     @async_test
     async def test_machine_max_transitions_pauses_once_then_resumes(self) -> None:
