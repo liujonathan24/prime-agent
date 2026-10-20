@@ -362,7 +362,7 @@ async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
             model: None,
             thinking: None,
             spawned_by_request_id: None,
-                fork_from: None,
+            fork_from: None,
             mcp_servers: None,
         })
         .await

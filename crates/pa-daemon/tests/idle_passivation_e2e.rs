@@ -295,7 +295,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
             model: None,
             thinking: None,
             spawned_by_request_id: None,
-                fork_from: None,
+            fork_from: None,
             mcp_servers: None,
         })
         .await
@@ -614,7 +614,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
             model: None,
             thinking: None,
             spawned_by_request_id: None,
-                fork_from: None,
+            fork_from: None,
             mcp_servers: None,
         })
         .await
