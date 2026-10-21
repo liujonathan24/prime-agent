@@ -175,6 +175,13 @@ pub struct RlmSpawnRequest {
     /// Session-scoped MCP servers installed on the child before its task
     /// prompt (`None`: the child sees only the parent's configured servers).
     pub mcp_servers: Option<Vec<crate::mcp::AcpMcpServerConfig>>,
+    /// Whether the parent's agent was running a turn when the spawn was
+    /// admitted: `Some(true)` for a spawn from a tool call in that turn,
+    /// `Some(false)` for a spawn made while the parent is idle (a factory
+    /// run's background task spawning after the parent's turn ended).
+    /// `None` when the host request could not tell; the host then treats
+    /// the spawn as in-turn.
+    pub parent_turn_in_flight: Option<bool>,
 }
 
 /// Validated `rlm.create_session` request handed to the host.
@@ -644,17 +651,15 @@ fn register_run(handlers: &mut HostRequestHandlers, bridge: &Arc<RlmHostBridge>)
                 // before the spawn admission's first await); a spawn
                 // outside an active run has no such turn, and an absent
                 // edge beats a wrong one.
-                request.spawned_by_request_id = match bridge.semantic_spawn.get() {
-                    Some(anchor) => {
-                        let agent = anchor.agent.upgrade();
-                        match agent {
-                            Some(agent) if agent.state().await.is_streaming => {
-                                anchor.recorder.last_turn_request_id()
-                            }
-                            _ => None,
-                        }
-                    }
+                let anchor = bridge.semantic_spawn.get();
+                let streaming = match anchor.and_then(|anchor| anchor.agent.upgrade()) {
+                    Some(agent) => Some(agent.state().await.is_streaming),
                     None => None,
+                };
+                request.parent_turn_in_flight = streaming;
+                request.spawned_by_request_id = match (anchor, streaming) {
+                    (Some(anchor), Some(true)) => anchor.recorder.last_turn_request_id(),
+                    _ => None,
                 };
                 let handle = bridge.host.spawn(request).await?;
                 // TS `_findLastAssistantMessage` at spawn: the spawning
@@ -691,6 +696,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
     let fork_from = fork_source_kwarg(&kwargs, OPERATION)?;
     let mcp_servers = mcp_servers_kwarg(&kwargs, OPERATION)?;
     Ok(RlmSpawnRequest {
+        parent_turn_in_flight: None,
         prompt: prompt.to_string(),
         name,
         model,

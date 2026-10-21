@@ -1196,6 +1196,7 @@ mod tests {
         Arc::get_mut(&mut node).unwrap().max_depth = 2;
         let gate = node.spawn_gate.lock().await;
         let mut spawn = InlineHost(Arc::clone(&node)).spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "finish the task".to_string(),
             name: Some("late".to_string()),
             model: None,
@@ -1229,6 +1230,7 @@ mod tests {
         let mut node = root_node(&options, &manager, Some(json!({ "responses": ["parent"] })));
         Arc::get_mut(&mut node).unwrap().max_depth = 2;
         let request = |fork: bool| RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "finish the task".to_string(),
             name: None,
             model: None,

@@ -228,6 +228,7 @@ fn wait_until<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> T 
 
 fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
     RlmSpawnRequest {
+        parent_turn_in_flight: None,
         prompt: prompt.to_string(),
         name: Some(name.to_string()),
         model: None,
@@ -320,6 +321,7 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
     // The fork: a child whose session file is a copy of the source.
     let forked = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             fork_from: Some(ForkSource {
                 session_file: source_file.to_string_lossy().to_string(),
                 entry_id: None,
@@ -382,6 +384,7 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
     // A bad source fails the spawn with nothing created.
     let error = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             fork_from: Some(ForkSource {
                 session_file: dir.path().join("ghost.jsonl").to_string_lossy().to_string(),
                 entry_id: None,
@@ -403,6 +406,7 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
     // Per-child MCP servers ride the spawn and the child still settles.
     let with_servers = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             mcp_servers: Some(vec![pa_core::mcp::AcpMcpServerConfig::Http {
                 name: "game".to_string(),
                 url: "http://127.0.0.1:9/mcp".to_string(),

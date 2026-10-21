@@ -4,6 +4,8 @@
 //! child spawn (session copy + kernel snapshot copy + session-scoped MCP
 //! install) -> the child's kernel. Every model turn is scripted
 //! (`"engine": "faux"`), so the cells run in real kernels with no provider.
+//! A third test checks that a spawn made while the parent is idle, as a
+//! factory's background task does, gets its task prompt at once.
 #![allow(clippy::large_futures)]
 // Fn length is a style gate, not correctness.
 #![allow(clippy::too_many_lines)]
@@ -467,5 +469,128 @@ fn run_forkprobe(fork_from: &Value, second_memo: u64) {
     assert_eq!(
         last_tool_result(&second),
         json!({ "probe": true, "memo": second_memo, "tools": ["echo"] }),
+    );
+}
+
+/// A factory spawns from a background task in the parent's kernel, often
+/// after the parent has ended its turn. Such a spawn has no parent turn to
+/// wait for: its task prompt must reach the child at once, not when the
+/// parent's next turn ends or the 60 s bound runs out. The parent's cell
+/// schedules one `rlm.spawn` two seconds out and the parent ends its turn,
+/// so the spawn lands while the parent is idle and nothing else wakes it.
+#[test]
+fn a_spawn_while_the_parent_is_idle_gets_its_task_at_once() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let error_receipt = dir.path().join("spawn.error");
+    let later = [
+        "import asyncio, traceback",
+        "async def spawn_later():",
+        "    await asyncio.sleep(2)",
+        "    try:",
+        "        await rlm.spawn(\"idle task\", name=\"late\")",
+        "    except Exception:",
+        "        open(ERROR_RECEIPT, \"w\").write(traceback.format_exc())",
+        "spawn_task = asyncio.get_running_loop().create_task(spawn_later())",
+    ]
+    .join("\n")
+    .replace(
+        "ERROR_RECEIPT",
+        &format!("{:?}", error_receipt.display().to_string()),
+    );
+    let script = dir.path().join("parent.json");
+    std::fs::write(
+        &script,
+        json!({
+            "engine": "faux",
+            "repeatLastResponse": true,
+            "responses": [
+                { "content": [
+                    { "type": "toolCall", "name": "python_repl", "arguments": { "code": later } },
+                ] },
+                { "text": "noted" },
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write parent script");
+    let child_script = dir.path().join("child.json");
+    std::fs::write(
+        &child_script,
+        json!({ "engine": "faux", "responses": [{ "text": "done" }] }).to_string(),
+    )
+    .expect("write child script");
+
+    let socket = dir.path().join("idle.sock");
+    let _daemon = spawn_supervisor(&socket, &agent_dir, &kernel_python);
+    wait_socket_ready(&socket);
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "c1",
+        &json!({
+            "type": "create",
+            "config": {
+                "cwd": dir.path().to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "script": script.to_string_lossy(),
+                "childScript": child_script.to_string_lossy(),
+            },
+        }),
+    );
+    let created = client.read_response("c1");
+    assert_eq!(created["success"], true, "create failed: {created}");
+    let session_id = created["data"]["activeSessionId"]
+        .as_str()
+        .or_else(|| created["data"]["id"].as_str())
+        .expect("active session id")
+        .to_string();
+    client.send_command(
+        "p1",
+        &json!({ "type": "prompt", "activeSessionId": session_id, "message": "spawn later" }),
+    );
+    assert_eq!(client.read_response("p1")["success"], true, "prompt failed");
+
+    // Time from the spawn's ledger row to the child's task row, both polled.
+    let ledger_dir = agent_dir.join("rlm-ledger");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut spawned: Option<(Instant, String)> = None;
+    let waited = loop {
+        if let Ok(error) = std::fs::read_to_string(&error_receipt) {
+            panic!("the background spawn failed: {error}");
+        }
+        if spawned.is_none() {
+            spawned = std::fs::read_dir(&ledger_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|entry| session_rows(&entry.path().to_string_lossy()))
+                .find(|row| row["op"] == "spawn")
+                .and_then(|row| Some((Instant::now(), row["child"].as_str()?.to_string())));
+        }
+        if let Some((at, child)) = &spawned {
+            let has_task = std::fs::read_to_string(child).is_ok_and(|_| {
+                session_rows(child)
+                    .iter()
+                    .any(|row| row["customType"] == "agent_message")
+            });
+            if has_task {
+                break at.elapsed();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never got its task (spawned: {spawned:?})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        waited < Duration::from_secs(10),
+        "an idle parent's spawn waited {waited:?} for its task"
     );
 }

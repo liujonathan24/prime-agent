@@ -84,6 +84,12 @@ impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
         Box::pin(async move {
+            // The turn boundary the kickoff waits for is the one current at
+            // admission (see `wait_turn_done`): read it before the first
+            // await, so a parent turn that ends while the child is being
+            // created (a fork's kernel copy, the worker launch) still
+            // releases the kickoff instead of leaving it for the next turn.
+            let turn_generation = *this.turn_done.subscribe().borrow();
             let identity = this.identity.lock().expect("identity lock").clone();
             if identity.rlm_depth >= identity.rlm_max_depth {
                 bail!(rlm_depth_limit_error(
@@ -283,12 +289,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
-            // Capture the current turn boundary before detaching: spawn
-            // admission happens mid-turn, so the parent's continuation
-            // request reaches the provider first (see `wait_turn_done`).
-            let turn_generation = *this.turn_done.subscribe().borrow();
+            // A spawn from a tool call in the parent's turn waits for that
+            // turn to end, so the parent's continuation request reaches the
+            // provider first (see `wait_turn_done`). A spawn made while the
+            // parent is idle (a factory run's background task, after the
+            // parent ended its turn) has no turn to wait for: waiting would
+            // hold the kickoff until the parent's NEXT turn ends, or the
+            // full bound.
+            let wait_for_parent_turn = request.parent_turn_in_flight != Some(false);
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
+                if wait_for_parent_turn {
+                    watcher_this.wait_turn_done(turn_generation).await;
+                }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
