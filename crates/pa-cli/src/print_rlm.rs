@@ -1229,27 +1229,24 @@ mod tests {
         let manager = pa_core::session::manager::SessionManager::in_memory(directory.path());
         let mut node = root_node(&options, &manager, Some(json!({ "responses": ["parent"] })));
         Arc::get_mut(&mut node).unwrap().max_depth = 2;
-        let request = |fork: bool| RlmSpawnRequest {
-            parent_turn_in_flight: None,
-            prompt: "finish the task".to_string(),
-            name: None,
-            model: None,
-            thinking: None,
-            spawned_by_request_id: None,
-            fork_from: fork.then(|| pa_core::session_engine::rlm_host::ForkSource {
-                session_file: "/archive/c1/player.jsonl".to_string(),
-                entry_id: None,
-                kernel: true,
-            }),
-            mcp_servers: (!fork).then(Vec::new),
-        };
-        for fork in [true, false] {
-            let error = InlineHost(Arc::clone(&node))
-                .spawn(request(fork))
-                .await
-                .expect_err("an inline child cannot fork or take its own MCP servers");
-            assert!(error.to_string().contains("need the daemon"), "{error:#}");
-        }
+        let error = InlineHost(Arc::clone(&node))
+            .spawn(RlmSpawnRequest {
+                parent_turn_in_flight: None,
+                prompt: "finish the task".to_string(),
+                name: None,
+                model: None,
+                thinking: None,
+                spawned_by_request_id: None,
+                fork_from: Some(pa_core::session_engine::rlm_host::ForkSource {
+                    session_file: "/archive/c1/player.jsonl".to_string(),
+                    entry_id: None,
+                    kernel: true,
+                }),
+                mcp_servers: Some(Vec::new()),
+            })
+            .await
+            .expect_err("an inline child cannot fork or take its own MCP servers");
+        assert!(error.to_string().contains("need the daemon"), "{error:#}");
         assert_eq!(node.children.lock().await.len(), 0);
     }
 

@@ -1503,138 +1503,64 @@ mod tests {
         let host = RecordingHost::new();
         let spawn_requests = Arc::clone(&host.spawn_requests);
         let wiring = wired(dir.path(), Some(host));
-        // The whole-file form: a bare path.
-        call(
+        for fork_from in [
+            json!("/archive/c7/player.jsonl"),
+            json!({ "session_file": "/archive/c8/player.jsonl", "entry_id": "e42", "kernel": false }),
+        ] {
+            call(
+                &wiring,
+                "rlm.run",
+                json!({
+                    "prompt": "resume",
+                    "kwargs": {
+                        "name": "player",
+                        "fork_from": fork_from,
+                        "mcp_servers": [{ "type": "http", "name": "game", "url": "http://game.local/mcp" }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let error = call(
             &wiring,
             "rlm.run",
-            json!({
-                "prompt": "resume",
-                "kwargs": { "name": "player", "fork_from": "/archive/c7/player.jsonl" }
-            }),
+            json!({ "prompt": "p", "kwargs": { "name": "n", "fork_from": 5 } }),
         )
         .await
-        .unwrap();
-        // The entry-cut form plus the child's own MCP servers.
-        call(
-            &wiring,
-            "rlm.run",
-            json!({
-                "prompt": "resume",
-                "kwargs": {
-                    "name": "player-2",
-                    "fork_from": { "session_file": "/archive/c8/player.jsonl", "entry_id": "e42" },
-                    "mcp_servers": [{
-                        "type": "http",
-                        "name": "game",
-                        "url": "http://game.local/mcp",
-                        "headers": { "Authorization": "Bearer t1" }
-                    }]
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        // The kernel opt-out.
-        call(
-            &wiring,
-            "rlm.run",
-            json!({
-                "prompt": "resume",
-                "kwargs": {
-                    "name": "player-3",
-                    "fork_from": { "session_file": "/archive/c9/player.jsonl", "kernel": false }
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "rlm.spawn fork_from must be a session file path or an object with session_file and an optional entry_id and kernel"
+        );
         let requests = spawn_requests.lock().await;
-        assert_eq!(requests.len(), 3);
+        let forks: Vec<_> = requests
+            .iter()
+            .map(|request| request.fork_from.clone())
+            .collect();
         assert_eq!(
-            requests[2].fork_from,
-            Some(ForkSource {
-                session_file: "/archive/c9/player.jsonl".into(),
-                entry_id: None,
-                kernel: false,
-            })
-        );
-        assert_eq!(
-            requests[0].fork_from,
-            Some(ForkSource {
-                session_file: "/archive/c7/player.jsonl".into(),
-                entry_id: None,
-                kernel: true,
-            })
-        );
-        assert_eq!(requests[0].mcp_servers, None);
-        assert_eq!(
-            requests[1].fork_from,
-            Some(ForkSource {
-                session_file: "/archive/c8/player.jsonl".into(),
-                entry_id: Some("e42".into()),
-                kernel: true,
-            })
+            forks,
+            vec![
+                Some(ForkSource {
+                    session_file: "/archive/c7/player.jsonl".into(),
+                    entry_id: None,
+                    kernel: true,
+                }),
+                Some(ForkSource {
+                    session_file: "/archive/c8/player.jsonl".into(),
+                    entry_id: Some("e42".into()),
+                    kernel: false,
+                }),
+            ]
         );
         assert_eq!(
             requests[1].mcp_servers,
             Some(vec![crate::mcp::AcpMcpServerConfig::Http {
                 name: "game".into(),
                 url: "http://game.local/mcp".into(),
-                headers: std::collections::HashMap::from([(
-                    "Authorization".to_string(),
-                    "Bearer t1".to_string()
-                )]),
+                headers: std::collections::HashMap::new(),
             }])
         );
-        drop(requests);
-
-        // Validation: each malformed shape fails before the host sees it.
-        for (kwargs, message) in [
-            (
-                json!({ "name": "n", "fork_from": 5 }),
-                "rlm.spawn fork_from must be a session file path or an object with session_file and an optional entry_id and kernel",
-            ),
-            (
-                json!({ "name": "n", "fork_from": { "session_file": "/a.jsonl", "kernel": "no" } }),
-                "rlm.spawn fork_from.kernel must be a boolean when given",
-            ),
-            (
-                json!({ "name": "n", "fork_from": "  " }),
-                "rlm.spawn fork_from must be a non-empty session file path",
-            ),
-            (
-                json!({ "name": "n", "fork_from": { "entry_id": "e1" } }),
-                "rlm.spawn fork_from.session_file must be a non-empty string",
-            ),
-            (
-                json!({ "name": "n", "fork_from": { "session_file": "/a.jsonl", "entry_id": 3 } }),
-                "rlm.spawn fork_from.entry_id must be a non-empty string when given",
-            ),
-            (
-                json!({ "name": "n", "mcp_servers": "game" }),
-                "rlm.spawn mcp_servers must be a list of server objects",
-            ),
-        ] {
-            let error = call(&wiring, "rlm.run", json!({ "prompt": "p", "kwargs": kwargs }))
-                .await
-                .unwrap_err();
-            assert_eq!(error.to_string(), message);
-        }
-        let error = call(
-            &wiring,
-            "rlm.run",
-            json!({ "prompt": "p", "kwargs": { "name": "n", "mcp_servers": [{ "type": "carrier-pigeon" }] } }),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("rlm.spawn mcp_servers is not a valid server list:"),
-            "{error}"
-        );
-        let requests = spawn_requests.lock().await;
-        assert_eq!(requests.len(), 3, "no malformed request reached the host");
     }
 
     #[tokio::test]

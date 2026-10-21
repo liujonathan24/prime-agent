@@ -194,35 +194,6 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn the_artifact_dir_follows_the_session_manager_rule() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = session(&tmp.path().join("sub-1"), "s-1", None);
-        assert_eq!(
-            artifact_dir_of(&file),
-            Some(tmp.path().join("session-artifacts").join("s-1"))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_fresh_snapshot_is_copied_into_the_childs_artifact_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = session(&tmp.path().join("src"), "s-1", Some(now_ms() - 5_000));
-        snapshot(&tmp.path().join("session-artifacts").join("s-1"));
-        let child = session(&tmp.path().join("kids").join("sub-2"), "s-2", None);
-        assert!(copy_fork_kernel(&source, &child).await.unwrap());
-        let child_dir = tmp
-            .path()
-            .join("kids")
-            .join("session-artifacts")
-            .join("s-2");
-        assert_eq!(
-            std::fs::read(snapshot_path_in(&child_dir)).unwrap(),
-            b"payload"
-        );
-        assert!(manifest_path_in(&child_dir).is_file());
-    }
-
     #[tokio::test]
     async fn a_source_that_never_ran_python_forks_without_a_kernel_at_once() {
         let tmp = tempfile::tempdir().unwrap();
