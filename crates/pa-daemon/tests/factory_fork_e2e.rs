@@ -1,9 +1,9 @@
 //! Factory fork e2e: a library machine run from a faux parent's kernel cell
 //! drives `fork_from` and `mcp_servers` through the whole product stack --
 //! `rlm.factory.run` -> factory executor -> `rlm.spawn` kwargs -> the daemon's
-//! child spawn (session copy + session-scoped MCP install) -> the child's
-//! kernel MCP client. Every model turn is scripted (`"engine": "faux"`), so
-//! the cells run in real kernels with no provider.
+//! child spawn (session copy + kernel snapshot copy + session-scoped MCP
+//! install) -> the child's kernel. Every model turn is scripted
+//! (`"engine": "faux"`), so the cells run in real kernels with no provider.
 #![allow(clippy::large_futures)]
 // Fn length is a style gate, not correctness.
 #![allow(clippy::too_many_lines)]
@@ -194,7 +194,7 @@ fn last_tool_result(path: &str) -> Value {
 
 /// The machine: `seed` hands a server list to `loop`, which installs it on
 /// each child (`mcp_servers`) and continues its own previous round
-/// (`fork_from: "self"`) on the second entry.
+/// (`fork_from`, `"self"` or the kernel opt-out) on the second entry.
 const MACHINE: &str = r#"---
 name: forkprobe
 description: Two states that exercise fork_from and mcp_servers.
@@ -215,7 +215,7 @@ author: e2e
      "inputs": [{"name": "servers", "type": "json", "from": "seed.servers", "hidden": true}],
      "outputs": [{"name": "note", "type": "json"}],
      "subagent": {"name": "loop", "prompt": "Probe the echo server.",
-                  "fork_from": "self",
+                  "fork_from": FORK_FROM,
                   "mcp_servers": {"input": "servers", "path": "list"}}}
   ],
   "transitions": [
@@ -228,6 +228,19 @@ author: e2e
 
 #[test]
 fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
+    // Round 2 spawns right after round 1 settles, before or after round 1's
+    // worker flushes its kernel snapshot: the copy must wait for that flush.
+    run_forkprobe(&json!("self"), 42);
+}
+
+#[test]
+fn a_fork_without_the_kernel_starts_a_fresh_namespace() {
+    run_forkprobe(&json!({ "self": true, "kernel": false }), 41);
+}
+
+/// Run the machine with `fork_from` and check the rounds; `second_memo` is
+/// what round 2's probe counts: 42 when round 1's namespace came along.
+fn run_forkprobe(fork_from: &Value, second_memo: u64) {
     let Some(kernel_python) = kernel_python() else {
         return;
     };
@@ -243,13 +256,17 @@ fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
     .expect("write settings.json");
     let machine_dir = agent_dir.join("machines").join("forkprobe");
     std::fs::create_dir_all(&machine_dir).expect("machine dir");
-    std::fs::write(machine_dir.join("MACHINE.md"), MACHINE).expect("write MACHINE.md");
+    std::fs::write(
+        machine_dir.join("MACHINE.md"),
+        MACHINE.replace("FORK_FROM", &fork_from.to_string()),
+    )
+    .expect("write MACHINE.md");
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("mcp_echo_server.py");
-    assert!(fixture.exists(), "fixture missing: {fixture:?}");
+    assert!(fixture.exists(), "fixture missing: {}", fixture.display());
     // Session-scoped, NOT in settings: only a child it is installed on sees it.
     let server = json!({
         "type": "stdio",
@@ -259,12 +276,14 @@ fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
         "cwd": dir.path().to_string_lossy(),
     });
 
-    // Every child runs the same script: probe the echo server, print the
+    // Every child runs the same script: count `memo` up from what its kernel
+    // holds (40 in a fresh namespace), probe the echo server, print the
     // verdict, then answer one fenced block that binds both states' outputs.
     let probe = [
         "import json",
         "from rlm import mcp",
-        "verdict = {\"probe\": True}",
+        "memo = globals().get(\"memo\", 40) + 1",
+        "verdict = {\"probe\": True, \"memo\": memo}",
         "try:",
         "    verdict[\"tools\"] = [tool[\"name\"] for tool in await mcp.list_tools(\"fixture-echo\")]",
         "except Exception as error:",
@@ -361,7 +380,7 @@ fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
     // The spawn ledger names each child's session file in spawn order; the
     // run is over once loop's second round has answered.
     let ledger_dir = agent_dir.join("rlm-ledger");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(150);
     let children = loop {
         if let Ok(error) = std::fs::read_to_string(&error_receipt) {
             panic!("the machine failed to start in the parent's cell: {error}");
@@ -379,11 +398,22 @@ fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
                 ))
             })
             .collect();
-        let answered = children.len() == 3
-            && session_rows(&children[2].1).iter().any(|row| {
-                row["message"]["role"] == "assistant"
-                    && row["message"]["content"].to_string().contains("```json")
-            });
+        // Round 2's file begins with round 1's copied kickoff and answer:
+        // round 2 has answered once an answer follows its own (second) kickoff.
+        let answered = children.len() == 3 && {
+            let rows = session_rows(&children[2].1);
+            let kickoffs: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row["customType"] == "agent_message")
+                .map(|(index, _)| index)
+                .collect();
+            kickoffs.len() == 2
+                && rows[kickoffs[1]..].iter().any(|row| {
+                    row["message"]["role"] == "assistant"
+                        && row["message"]["content"].to_string().contains("```json")
+                })
+        };
         if answered {
             break children;
         }
@@ -424,15 +454,18 @@ fn a_machine_forks_its_own_rounds_and_installs_session_mcp_servers() {
     );
 
     // mcp_servers: only the children it was installed on see the server.
+    // The kernel: round 2 counts on from round 1's `memo` only when the fork
+    // copied round 1's kernel snapshot.
     assert_eq!(
         last_tool_result(&seed),
-        json!({ "probe": true, "error": "\"MCP server 'fixture-echo' is not declared in user settings\"" }),
+        json!({ "probe": true, "memo": 41, "error": "\"MCP server 'fixture-echo' is not declared in user settings\"" }),
     );
-    for round in [&first, &second] {
-        assert_eq!(
-            last_tool_result(round),
-            json!({ "probe": true, "tools": ["echo"] }),
-            "{round}"
-        );
-    }
+    assert_eq!(
+        last_tool_result(&first),
+        json!({ "probe": true, "memo": 41, "tools": ["echo"] }),
+    );
+    assert_eq!(
+        last_tool_result(&second),
+        json!({ "probe": true, "memo": second_memo, "tools": ["echo"] }),
+    );
 }

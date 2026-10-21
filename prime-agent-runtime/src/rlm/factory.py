@@ -265,7 +265,9 @@ def _validate_spawn_option(
     source from a bound json input); ``mcp_servers`` takes only the
     input/path form. The input must be one of the state's declared json
     inputs: a text port captures the whole answer, so a path into it
-    cannot resolve.
+    cannot resolve. A fork copies the source's kernel too; ``fork_from``
+    opts out with ``"kernel": false`` on the object form, and
+    ``{"self": true, "kernel": false}`` is ``"self"`` without the kernel.
     """
     ref = state["id"]
     subagent = state.get("subagent")
@@ -283,7 +285,16 @@ def _validate_spawn_option(
         accepted = "'self' or an object {input, path}" if allow_self else "an object {input, path}"
         errors.append(f"{noun} {ref} inline subagent {key} must be {accepted}")
         return
-    unknown = sorted(set(option) - {"input", "path"})
+    if allow_self and "kernel" in option and not isinstance(option["kernel"], bool):
+        errors.append(f"{noun} {ref} inline subagent {key}.kernel must be a boolean")
+    if allow_self and "self" in option:
+        if option["self"] is not True:
+            errors.append(f"{noun} {ref} inline subagent {key}.self must be true")
+        unknown = sorted(set(option) - {"self", "kernel"})
+        if unknown:
+            errors.append(f"{noun} {ref} inline subagent {key} has unsupported keys {unknown}")
+        return
+    unknown = sorted(set(option) - ({"input", "path", "kernel"} if allow_self else {"input", "path"}))
     if unknown:
         errors.append(f"{noun} {ref} inline subagent {key} has unsupported keys {unknown}")
     input_name = option.get("input")
@@ -1430,7 +1441,7 @@ class _ResolvedSubagent:
     name: str | None = None
     model: str | None = None
     thinking: str | None = None
-    fork_from: Any = None  # "self" | {"input", "path"} | None
+    fork_from: Any = None  # "self" | {"self", "kernel"} | {"input", "path", "kernel"?} | None
     mcp_servers: Any = None  # {"input", "path"} | None
 
 
@@ -1478,7 +1489,8 @@ class _NodeInstance:
     session_file: str | None = None  # the child's persisted session file (the
     # spawn handle's ``session_file``); a later ``fork_from: "self"`` copies it.
     fork_from: Any = None  # the resolved spawn kwarg: a path, {"session_file",
-    # "entry_id"}, or None for a fresh session
+    # "entry_id"?, "kernel"?}, or None for a fresh session
+    forked_kernel: bool | None = None  # the spawn handle's ``forked_kernel``
     mcp_servers: Any = None  # the resolved spawn kwarg: a server list, or None
 
 
@@ -1518,7 +1530,7 @@ class _StateRun:
     name: str | None = None  # configured inline subagent name; labels children
     model: str | None = None
     thinking: str | None = None
-    fork_from: Any = None  # the spec's spawn option: "self" | {"input", "path"} | None
+    fork_from: Any = None  # the spec's spawn option: "self" | {"self", "kernel"} | {"input", "path", "kernel"?} | None
     mcp_servers: Any = None  # the spec's spawn option: {"input", "path"} | None
     max_entries: int = STATE_MAX_ENTRIES_DEFAULT
     entries_used: int = 0
@@ -1938,6 +1950,7 @@ class FactoryExecutor:
                     "error": instance.error,
                     "session_file": instance.session_file,
                     "forked_from": copy.deepcopy(instance.fork_from),
+                    "forked_kernel": instance.forked_kernel,
                 }
                 for entry in state.entries
                 for instance in entry.instances
@@ -2908,34 +2921,43 @@ class FactoryExecutor:
         spec = state.fork_from
         if spec is None:
             return None, None
-        if spec == "self":
+        # The spec's ``"kernel": false`` opts the fork out of the kernel copy;
+        # the host copies it by default, so only the opt-out rides the kwarg.
+        kernel = not (isinstance(spec, dict) and spec.get("kernel") is False)
+        if spec == "self" or (isinstance(spec, dict) and spec.get("self") is True):
             latest = state.latest_settle()
             if latest is None:
                 return None, None
             for instance in reversed(latest.instances):
                 if instance.status == "done" and instance.session_file:
-                    return instance.session_file, None
+                    if kernel:
+                        return instance.session_file, None
+                    return {"session_file": instance.session_file, "kernel": False}, None
             return None, None
         value, error = _spawn_option_value(spec, values, f"state {state.state_id!r} fork_from")
         if error is not None or value is None:
             return None, error
         if isinstance(value, str) and value.strip():
-            return value, None
+            return (value if kernel else {"session_file": value, "kernel": False}), None
         if isinstance(value, dict):
             session_file = value.get("session_file")
             entry_id = value.get("entry_id")
+            bound_kernel = value.get("kernel")
             if (
                 isinstance(session_file, str)
                 and session_file.strip()
                 and (entry_id is None or (isinstance(entry_id, str) and entry_id.strip()))
+                and (bound_kernel is None or isinstance(bound_kernel, bool))
             ):
-                resolved: dict[str, str] = {"session_file": session_file}
+                resolved: dict[str, Any] = {"session_file": session_file}
                 if entry_id is not None:
                     resolved["entry_id"] = entry_id
+                if not kernel or bound_kernel is False:
+                    resolved["kernel"] = False
                 return resolved, None
         return None, (
             f"state {state.state_id!r} fork_from resolved to {type(value).__name__}; "
-            "expected a session file path or {session_file, entry_id}"
+            "expected a session file path or {session_file, entry_id, kernel}"
         )
 
     def _resolve_mcp_servers(self, state: _StateRun, values: dict[str, str]) -> "tuple[Any, str | None]":
@@ -3055,6 +3077,7 @@ class FactoryExecutor:
             return "stopped"
         instance.child_id = handle.rlm_child_id
         instance.session_file = str(handle.session_file) if handle.session_file else None
+        instance.forked_kernel = handle.forked_kernel
         instance.spawned_at = self._now_fn()
         instance.status = "running"
         instance.rate_limit_streak = 0
@@ -3062,6 +3085,7 @@ class FactoryExecutor:
         spawned_fields: dict[str, Any] = {}
         if instance.fork_from is not None:
             spawned_fields["forked_from"] = copy.deepcopy(instance.fork_from)
+            spawned_fields["forked_kernel"] = instance.forked_kernel
         if instance.mcp_servers is not None:
             spawned_fields["mcp_servers"] = [server.get("name") for server in instance.mcp_servers]
         self._event(
@@ -5281,9 +5305,13 @@ the cap, fails to capture, and fails the producing state through its
   entry; `null` there starts fresh. `"mcp_servers": {"input": ..., "path": ...}`
   reads a list of session-scoped MCP server objects the same way and installs
   them on the child before its task prompt (one game server per child, say).
-  Both options must name a `json` input of the state. The spawned child's
-  `session_file` rides the status instance rows, and the `spawned` event
-  carries `forked_from`.
+  Both options must name a `json` input of the state. A fork copies the
+  source's Python kernel too (its latest snapshot, even for an `entry_id`
+  cut), so names the source defined in `python_repl` exist in the child;
+  `"kernel": false` on the object form opts out, and
+  `{"self": true, "kernel": false}` is `"self"` without the kernel. The
+  spawned child's `session_file` rides the status instance rows, and the
+  `spawned` event carries `forked_from` and `forked_kernel`.
 - **Cycles are legal**: there is no acyclicity requirement — self-loops and
   back edges validate. The one rule is an entry state somewhere; a dag
   whose every node depends on another compiles to no entry states and is

@@ -2009,6 +2009,27 @@ class ValidateFactoryMachineTest(unittest.TestCase):
         self.assertEqual(
             validate_factory_machine(machine(mcp_servers={"input": "decision", "path": "next.mcp_servers"})), []
         )
+        # The kernel opt-out: on the object form, and as {"self": true, "kernel": false}.
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"input": "decision", "path": "next.session_ref", "kernel": False})),
+            [],
+        )
+        self.assertEqual(validate_factory_machine(machine(fork_from={"self": True, "kernel": False})), [])
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"self": True, "kernel": "no"})),
+            ["state b inline subagent fork_from.kernel must be a boolean"],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(fork_from={"self": False, "input": "decision"})),
+            [
+                "state b inline subagent fork_from.self must be true",
+                "state b inline subagent fork_from has unsupported keys ['input']",
+            ],
+        )
+        self.assertEqual(
+            validate_factory_machine(machine(mcp_servers={"input": "decision", "kernel": False})),
+            ["state b inline subagent mcp_servers has unsupported keys ['kernel']"],
+        )
         # A text input captures the whole answer: no path can resolve into it.
         self.assertEqual(
             validate_factory_machine(machine(fork_from={"input": "note", "path": "x"})),
@@ -5752,6 +5773,50 @@ class FactoryExecutorTest(_ExecutorTestCase):
         spawned = next(event for event in status["events"] if event["kind"] == "spawned" and event["node"] == "player")
         self.assertEqual(spawned["forked_from"], {"session_file": "/archive/c7/player.jsonl", "entry_id": "e42"})
         self.assertEqual(spawned["mcp_servers"], ["game"])
+
+    @async_test
+    async def test_machine_fork_kernel_opt_out_rides_the_spawn_kwarg(self) -> None:
+        # The host copies the source's kernel by default; a spec's
+        # ``"kernel": false`` (on {"self": true} or on the input/path form)
+        # reaches the spawn as the wire object's ``kernel: False``.
+        for index in (1, 2):
+            self.host.child_outcomes[f"child-{index}"] = {
+                "status": "done",
+                "answer": '```json\n{"decision": {"ref": "/archive/p.jsonl"}}\n```',
+            }
+        self.host.outcomes["player"] = {"status": "done", "answer": "played"}
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "tick",
+                        "entry": True,
+                        "subagent": {"prompt": "Tick.", "fork_from": {"self": True, "kernel": False}},
+                        "max_entries": 2,
+                        "outputs": [{"name": "decision", "type": "json"}],
+                    },
+                    {
+                        "id": "player",
+                        "subagent": {
+                            "prompt": "Resume.",
+                            "fork_from": {"input": "decision", "path": "ref", "kernel": False},
+                        },
+                        "inputs": [{"name": "decision", "type": "json", "from": "tick.decision"}],
+                    },
+                ],
+                "transitions": [
+                    {"from": "tick", "to": "tick"},
+                    {"from": "tick", "to": "player"},
+                ],
+            }
+        )
+        result = await self.start()
+        await self.settle(result)
+        ticks = [call["kwargs"] for call in self.host.spawn_calls("tick")]
+        self.assertNotIn("fork_from", ticks[0])
+        self.assertEqual(ticks[1]["fork_from"], {"session_file": "/tmp/child-1/child-1.jsonl", "kernel": False})
+        player = self.host.spawn_calls("player")[0]["kwargs"]
+        self.assertEqual(player["fork_from"], {"session_file": "/archive/p.jsonl", "kernel": False})
 
     @async_test
     async def test_machine_max_transitions_pauses_once_then_resumes(self) -> None:
