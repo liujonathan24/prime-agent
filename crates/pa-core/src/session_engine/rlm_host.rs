@@ -44,6 +44,10 @@ pub struct RlmSpawnHandle {
     /// spawn's `fork_from` names it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_file: Option<String>,
+    /// A forked spawn only: whether the source's kernel snapshot was copied
+    /// (`false` for `kernel: false`, or a source with no snapshot).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forked_kernel: Option<bool>,
 }
 
 /// `rlm.create_session` handle: one resident depth-0 daemon session.
@@ -145,6 +149,11 @@ pub struct RlmChildResult {
 pub struct ForkSource {
     pub session_file: String,
     pub entry_id: Option<String>,
+    /// Copy the source's kernel snapshot too (the default), so the child's
+    /// kernel revives the source's Python namespace. The snapshot is the
+    /// source's LATEST kernel: a fork cut at `entry_id` still gets the names
+    /// the source defined after that entry.
+    pub kernel: bool,
 }
 
 /// Validated `rlm.spawn` request handed to the child-session host.
@@ -692,7 +701,7 @@ fn spawn_request_from_payload(prompt: &str, data: &Value) -> anyhow::Result<RlmS
     })
 }
 
-/// `fork_from`: a session file path, or `{"session_file", "entry_id"?}`.
+/// `fork_from`: a session file path, or `{"session_file", "entry_id"?, "kernel"?}`.
 fn fork_source_kwarg(
     kwargs: &Map<String, Value>,
     operation: &str,
@@ -706,6 +715,7 @@ fn fork_source_kwarg(
             Ok(Some(ForkSource {
                 session_file: path.clone(),
                 entry_id: None,
+                kernel: true,
             }))
         }
         Some(Value::Object(object)) => {
@@ -722,14 +732,22 @@ fn fork_source_kwarg(
                     )
                 }
             };
+            let kernel = match object.get("kernel") {
+                None | Some(Value::Null) => true,
+                Some(Value::Bool(kernel)) => *kernel,
+                Some(_) => {
+                    anyhow::bail!("{operation} fork_from.kernel must be a boolean when given")
+                }
+            };
             Ok(Some(ForkSource {
                 session_file,
                 entry_id,
+                kernel,
             }))
         }
         Some(_) => anyhow::bail!(
             "{operation} fork_from must be a session file path or an object with session_file \
-             and an optional entry_id"
+             and an optional entry_id and kernel"
         ),
     }
 }
@@ -1007,6 +1025,7 @@ mod tests {
                     session_dir: "/tmp/sub-1".into(),
                     model: "p/m".into(),
                     session_file: None,
+                    forked_kernel: None,
                 })
             })
         }
@@ -1509,13 +1528,36 @@ mod tests {
         )
         .await
         .unwrap();
+        // The kernel opt-out.
+        call(
+            &wiring,
+            "rlm.run",
+            json!({
+                "prompt": "resume",
+                "kwargs": {
+                    "name": "player-3",
+                    "fork_from": { "session_file": "/archive/c9/player.jsonl", "kernel": false }
+                }
+            }),
+        )
+        .await
+        .unwrap();
         let requests = spawn_requests.lock().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[2].fork_from,
+            Some(ForkSource {
+                session_file: "/archive/c9/player.jsonl".into(),
+                entry_id: None,
+                kernel: false,
+            })
+        );
         assert_eq!(
             requests[0].fork_from,
             Some(ForkSource {
                 session_file: "/archive/c7/player.jsonl".into(),
                 entry_id: None,
+                kernel: true,
             })
         );
         assert_eq!(requests[0].mcp_servers, None);
@@ -1524,6 +1566,7 @@ mod tests {
             Some(ForkSource {
                 session_file: "/archive/c8/player.jsonl".into(),
                 entry_id: Some("e42".into()),
+                kernel: true,
             })
         );
         assert_eq!(
@@ -1543,7 +1586,11 @@ mod tests {
         for (kwargs, message) in [
             (
                 json!({ "name": "n", "fork_from": 5 }),
-                "rlm.spawn fork_from must be a session file path or an object with session_file and an optional entry_id",
+                "rlm.spawn fork_from must be a session file path or an object with session_file and an optional entry_id and kernel",
+            ),
+            (
+                json!({ "name": "n", "fork_from": { "session_file": "/a.jsonl", "kernel": "no" } }),
+                "rlm.spawn fork_from.kernel must be a boolean when given",
             ),
             (
                 json!({ "name": "n", "fork_from": "  " }),
@@ -1581,7 +1628,7 @@ mod tests {
             "{error}"
         );
         let requests = spawn_requests.lock().await;
-        assert_eq!(requests.len(), 2, "no malformed request reached the host");
+        assert_eq!(requests.len(), 3, "no malformed request reached the host");
     }
 
     #[tokio::test]

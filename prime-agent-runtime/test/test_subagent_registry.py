@@ -135,15 +135,34 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(
             host_request.await_args.args[1]["kwargs"]["fork_from"], {"session_file": "/archive/c8.jsonl"}
         )
+        # The kernel opt-out rides the wire object; the handle reports the copy.
+        host_request.reset_mock()
+        host_request.return_value["forked_kernel"] = False
+        with patch.object(rlm_module, "host_request", host_request):
+            no_kernel = asyncio.run(
+                rlm_module.rlm.spawn("p", name="n", fork_from={"session_file": "/archive/c9.jsonl", "kernel": False})
+            )
+        self.assertEqual(
+            host_request.await_args.args[1]["kwargs"]["fork_from"], {"session_file": "/archive/c9.jsonl", "kernel": False}
+        )
+        self.assertIs(no_kernel.forked_kernel, False)
+        host_request.return_value.pop("forked_kernel")
         # A handle without a reported file keeps None.
         host_request.return_value.pop("session_file")
         with patch.object(rlm_module, "host_request", host_request):
             plain = asyncio.run(rlm_module.rlm.spawn("p", name="n2"))
         self.assertIsNone(plain.session_file)
+        self.assertIsNone(plain.forked_kernel)
 
     def test_rejects_malformed_fork_from_and_mcp_servers_before_the_host(self) -> None:
         host_request = AsyncMock()
-        bad_forks = ["", {"entry_id": "e1"}, {"session_file": "/a.jsonl", "entry_id": ""}, 42]
+        bad_forks = [
+            "",
+            {"entry_id": "e1"},
+            {"session_file": "/a.jsonl", "entry_id": ""},
+            {"session_file": "/a.jsonl", "kernel": "no"},
+            42,
+        ]
         with patch.object(rlm_module, "host_request", host_request):
             for bad in bad_forks:
                 with self.assertRaises(TypeError, msg=repr(bad)):

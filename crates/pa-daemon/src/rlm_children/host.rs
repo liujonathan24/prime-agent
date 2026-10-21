@@ -127,11 +127,25 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
                 // A forked child's copy is written before the worker exists,
                 // so a bad source fails the spawn with nothing to tear down.
-                let session_source = match &request.fork_from {
-                    None => ChildSessionSource::Fresh,
-                    Some(source) => ChildSessionSource::Forked(
-                        fork_child_session(source, Path::new(&cwd), &child_dir).await?,
-                    ),
+                let (session_source, forked_kernel) = match &request.fork_from {
+                    None => (ChildSessionSource::Fresh, None),
+                    Some(source) => {
+                        let forked =
+                            fork_child_session(source, Path::new(&cwd), &child_dir).await?;
+                        // The kernel snapshot lands in the copy's artifact
+                        // dir before the worker exists: its resume prewarm
+                        // revives the source's namespace.
+                        let kernel = if source.kernel {
+                            super::fork_kernel::copy_fork_kernel(
+                                Path::new(&source.session_file),
+                                &forked,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                        (ChildSessionSource::Forked(forked), Some(kernel))
+                    }
                 };
                 let runtime_metadata = json!({
                     "kind": "subagent",
@@ -221,10 +235,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 this.children.lock().await.push(Arc::clone(&record));
                 this.refresh_running().await;
                 this.emit_child_update(&record).await;
-                anyhow::Ok((record, created, model))
+                anyhow::Ok((record, created, model, forked_kernel))
             }
             .await;
-            let (record, created, model) = admission?;
+            let (record, created, model, forked_kernel) = admission?;
             // The task prompt runs detached from the spawn admission: the
             // handle returns at registration and the child's first turn
             // starts after the parent's continuation request is in flight.
@@ -343,6 +357,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 session_dir: created.session_dir,
                 model,
                 session_file: created.session_file,
+                forked_kernel,
             })
         })
     }

@@ -779,6 +779,7 @@ impl RlmSubagentHost for InlineHost {
                 session_dir: child_node.session_dir.clone(),
                 model: selector,
                 session_file: None,
+                forked_kernel: None,
             })
         })
     }
@@ -1236,6 +1237,7 @@ mod tests {
             fork_from: fork.then(|| pa_core::session_engine::rlm_host::ForkSource {
                 session_file: "/archive/c1/player.jsonl".to_string(),
                 entry_id: None,
+                kernel: true,
             }),
             mcp_servers: (!fork).then(Vec::new),
         };

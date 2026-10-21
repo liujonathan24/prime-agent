@@ -33,6 +33,8 @@ class RLMSpawnHandle:
     #: The child's session file when the host reports one (a persisted child);
     #: ``fork_from`` on a later spawn names it.
     session_file: Path | None = None
+    #: A forked spawn only: whether the source's kernel snapshot was copied.
+    forked_kernel: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -118,12 +120,14 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
         raise RuntimeError("rlm.spawn returned an invalid spawn handle")
     session_file = payload.get("session_file")
+    forked_kernel = payload.get("forked_kernel")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
         model=model,
         session_file=Path(session_file) if isinstance(session_file, str) and session_file else None,
+        forked_kernel=forked_kernel if isinstance(forked_kernel, bool) else None,
     )
 
 
@@ -182,7 +186,7 @@ def emit(data: dict[str, Any]) -> None:
 
 
 def _fork_from_kwarg(fork_from: str | Path | dict[str, Any]) -> dict[str, Any]:
-    """Normalize ``fork_from`` to the wire object ``{"session_file", "entry_id"?}``."""
+    """Normalize ``fork_from`` to the wire object ``{"session_file", "entry_id"?, "kernel"?}``."""
     if isinstance(fork_from, Path):
         fork_from = str(fork_from)
     if isinstance(fork_from, str):
@@ -198,9 +202,14 @@ def _fork_from_kwarg(fork_from: str | Path | dict[str, Any]) -> dict[str, Any]:
         entry_id = fork_from.get("entry_id")
         if entry_id is not None and (not isinstance(entry_id, str) or not entry_id.strip()):
             raise TypeError("fork_from.entry_id must be a non-empty string when given")
+        kernel = fork_from.get("kernel")
+        if kernel is not None and not isinstance(kernel, bool):
+            raise TypeError("fork_from.kernel must be a bool when given")
         wire: dict[str, Any] = {"session_file": session_file}
         if entry_id is not None:
             wire["entry_id"] = entry_id
+        if kernel is not None:
+            wire["kernel"] = kernel
         return wire
     raise TypeError(f"fork_from must be a path or a dict, got {type(fork_from).__name__}")
 
@@ -224,8 +233,11 @@ async def spawn(
     of an empty one: a path copies the whole file, and
     ``{"session_file": path, "entry_id": id}`` copies the branch up to that entry.
     The child then reads its ``[task from parent]`` prompt on top of the copied
-    conversation. The source must belong to a settled child (or a session no
-    worker holds); the copy never touches the source.
+    conversation. The source's Python kernel comes too: its latest snapshot is
+    copied, so names the source defined in ``python_repl`` exist in the child
+    (``"kernel": False`` in the dict form opts out; a fork cut at ``entry_id``
+    still gets the source's LATEST kernel). The source must belong to a settled
+    child (or a session no worker holds); the copy never touches the source.
     ``mcp_servers`` gives the child its own session-scoped MCP servers (the same
     objects ``replace_acp_mcp_servers`` takes: ``{"type": "http", "name", "url",
     "headers"}`` or ``{"type": "stdio", "name", "command", "args", "cwd", "env"}``);

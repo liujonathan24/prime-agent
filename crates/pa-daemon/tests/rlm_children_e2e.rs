@@ -323,6 +323,7 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
             fork_from: Some(ForkSource {
                 session_file: source_file.to_string_lossy().to_string(),
                 entry_id: None,
+                kernel: true,
             }),
             ..spawn_request("player-2", "continue the lane")
         })
@@ -331,6 +332,8 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
     children.notify_turn_done();
     let forked_file = PathBuf::from(forked.session_file.as_deref().expect("forked session file"));
     assert_ne!(forked_file, source_file, "the fork is its own file");
+    // The source never ran Python: there is no kernel to copy.
+    assert_eq!(forked.forked_kernel, Some(false));
     assert!(
         forked_file.starts_with(&forked.session_dir),
         "the copy lands in the child's own dir: {} vs {}",
@@ -382,6 +385,7 @@ async fn rlm_children_fork_from_copies_the_source_session_and_mcp_servers_instal
             fork_from: Some(ForkSource {
                 session_file: dir.path().join("ghost.jsonl").to_string_lossy().to_string(),
                 entry_id: None,
+                kernel: true,
             }),
             ..spawn_request("player-3", "never")
         })
