@@ -420,11 +420,14 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
 
     let handle = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "ship the roster lane".to_string(),
             name: Some("child-a".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         })
         .await
         .expect("spawn child");

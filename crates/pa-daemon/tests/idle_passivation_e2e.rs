@@ -290,11 +290,14 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
     });
     let handle = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "work on the lane".to_string(),
             name: Some("parked-kid".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         })
         .await
         .expect("spawn the child");
@@ -607,11 +610,14 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
     });
     let handle = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "work on the lane".to_string(),
             name: Some("parked-kid".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         })
         .await
         .expect("spawn the child");

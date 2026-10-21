@@ -255,6 +255,62 @@ def _validate_run_fields(run: Any, errors: list[str]) -> int | None:
     return run_budget
 
 
+def _validate_spawn_option(
+    state: dict[str, Any], key: str, *, allow_self: bool, noun: str, errors: list[str]
+) -> None:
+    """The inline subagent's spawn options that bind at entry time.
+
+    ``fork_from`` is ``"self"`` (copy this state's own previous settled
+    child) or ``{"input": <json input>, "path": <dotted path>}`` (read the
+    source from a bound json input); ``mcp_servers`` takes only the
+    input/path form. The input must be one of the state's declared json
+    inputs: a text port captures the whole answer, so a path into it
+    cannot resolve. A fork copies the source's kernel too; ``fork_from``
+    opts out with ``"kernel": false`` on the object form, and
+    ``{"self": true, "kernel": false}`` is ``"self"`` without the kernel.
+    """
+    ref = state["id"]
+    subagent = state.get("subagent")
+    if not isinstance(subagent, dict) or key not in subagent:
+        return
+    option = subagent.get(key)
+    if option is None:
+        errors.append(f"{noun} {ref} inline subagent {key} must not be null; omit the key instead")
+        return
+    if option == "self":
+        if not allow_self:
+            errors.append(f"{noun} {ref} inline subagent {key} does not accept 'self'")
+        return
+    if not isinstance(option, dict):
+        accepted = "'self' or an object {input, path}" if allow_self else "an object {input, path}"
+        errors.append(f"{noun} {ref} inline subagent {key} must be {accepted}")
+        return
+    if allow_self and "kernel" in option and not isinstance(option["kernel"], bool):
+        errors.append(f"{noun} {ref} inline subagent {key}.kernel must be a boolean")
+    if allow_self and "self" in option:
+        if option["self"] is not True:
+            errors.append(f"{noun} {ref} inline subagent {key}.self must be true")
+        unknown = sorted(set(option) - {"self", "kernel"})
+        if unknown:
+            errors.append(f"{noun} {ref} inline subagent {key} has unsupported keys {unknown}")
+        return
+    unknown = sorted(set(option) - ({"input", "path", "kernel"} if allow_self else {"input", "path"}))
+    if unknown:
+        errors.append(f"{noun} {ref} inline subagent {key} has unsupported keys {unknown}")
+    input_name = option.get("input")
+    if not _is_nonempty_str(input_name):
+        errors.append(f"{noun} {ref} inline subagent {key}.input must be a non-empty input name")
+    else:
+        declared_inputs = _declared_port_types(state, "inputs")
+        if input_name not in declared_inputs:
+            errors.append(f"{noun} {ref} inline subagent {key}.input must name one of this {noun}'s inputs, got {input_name!r}")
+        elif declared_inputs[input_name] != "json":
+            errors.append(f"{noun} {ref} inline subagent {key}.input {input_name!r} must have type 'json'")
+    path = option.get("path")
+    if path is not None and not _is_nonempty_str(path):
+        errors.append(f"{noun} {ref} inline subagent {key}.path must be a non-empty dotted path when provided")
+
+
 def _validate_state_fields(
     state: dict[str, Any],
     *,
@@ -302,6 +358,8 @@ def _validate_state_fields(
                 f"{noun} {ref} inline subagent name must be at most "
                 f"{SUBAGENT_NAME_MAX_LENGTH} characters, got {len(configured_name.strip())}"
             )
+        _validate_spawn_option(state, "fork_from", allow_self=True, noun=noun, errors=errors)
+        _validate_spawn_option(state, "mcp_servers", allow_self=False, noun=noun, errors=errors)
     else:
         errors.append(
             f"{noun} {ref} requires a subagent: a harness subagent id/title string "
@@ -368,6 +426,9 @@ def _validate_state_fields(
         optional = inp.get("optional")
         if optional is not None and not isinstance(optional, bool):
             errors.append(f"{noun} {ref} input {name!r} optional must be a boolean when provided")
+        for flag in ("hidden", "verbatim"):
+            if inp.get(flag) is not None and not isinstance(inp.get(flag), bool):
+                errors.append(f"{noun} {ref} input {name!r} {flag} must be a boolean when provided")
         if not _is_nonempty_str(name):
             errors.append(f"{noun} {ref} inputs[{index}] requires a non-empty name")
         elif name in seen_input_names:
@@ -1246,6 +1307,30 @@ def _parse_json_output(
     return None, error
 
 
+def _spawn_option_value(spec: dict[str, Any], values: dict[str, str], what: str) -> "tuple[Any, str | None]":
+    """Read a spawn option's value from the bound inputs: the named json
+    input (already serialized for the prompt) parsed back, then the dotted
+    ``path`` walked. A missing input or an unresolvable path is ``None``
+    (no option); a non-object along the path is a binding failure."""
+    input_name = spec.get("input")
+    raw = values.get(input_name) if isinstance(input_name, str) else None
+    if raw is None:
+        return None, None
+    try:
+        value: Any = json.loads(raw)
+    except ValueError:
+        return None, f"{what}: input {input_name!r} is not JSON"
+    path = spec.get("path")
+    if isinstance(path, str) and path:
+        for part in path.split("."):
+            if value is None:
+                return None, None
+            if not isinstance(value, dict):
+                return None, f"{what}: path {path!r} crosses a non-object at {part!r}"
+            value = value.get(part)
+    return value, None
+
+
 def _render_prompt(template: str, values: dict[str, str]) -> str:
     """Render bound input values into a prompt template.
 
@@ -1347,6 +1432,19 @@ def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _ResolvedSubagent:
+    """One state's resolved spawn settings: the prompt template, the
+    child label, model/thinking, and the entry-time spawn options."""
+
+    prompt: str
+    name: str | None = None
+    model: str | None = None
+    thinking: str | None = None
+    fork_from: Any = None  # "self" | {"self", "kernel"} | {"input", "path", "kernel"?} | None
+    mcp_servers: Any = None  # {"input", "path"} | None
+
+
 def _validate_spawn_settings(model: Any, thinking: Any) -> str | None:
     for key, value in (("model", model), ("thinking", thinking)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -1388,6 +1486,12 @@ class _NodeInstance:
     # exit's last assistant text as delivered work (the M4 class).
     error: str | None = None
     tool_uses: int = 0
+    session_file: str | None = None  # the child's persisted session file (the
+    # spawn handle's ``session_file``); a later ``fork_from: "self"`` copies it.
+    fork_from: Any = None  # the resolved spawn kwarg: a path, {"session_file",
+    # "entry_id"?, "kernel"?}, or None for a fresh session
+    forked_kernel: bool | None = None  # the spawn handle's ``forked_kernel``
+    mcp_servers: Any = None  # the resolved spawn kwarg: a server list, or None
 
 
 @dataclass
@@ -1426,6 +1530,8 @@ class _StateRun:
     name: str | None = None  # configured inline subagent name; labels children
     model: str | None = None
     thinking: str | None = None
+    fork_from: Any = None  # the spec's spawn option: "self" | {"self", "kernel"} | {"input", "path", "kernel"?} | None
+    mcp_servers: Any = None  # the spec's spawn option: {"input", "path"} | None
     max_entries: int = STATE_MAX_ENTRIES_DEFAULT
     entries_used: int = 0
     entries: list[_StateEntry] = field(default_factory=list)
@@ -1842,6 +1948,9 @@ class FactoryExecutor:
                     "child": instance.child_id,
                     "duration_ms": instance.duration_ms,
                     "error": instance.error,
+                    "session_file": instance.session_file,
+                    "forked_from": copy.deepcopy(instance.fork_from),
+                    "forked_kernel": instance.forked_kernel,
                 }
                 for entry in state.entries
                 for instance in entry.instances
@@ -2229,7 +2338,7 @@ class FactoryExecutor:
 
     def _resolve_subagents(
         self, harness: Any, canonical: dict[str, Any]
-    ) -> tuple[dict[str, tuple[str, str | None, str | None, str | None]], list[str]]:
+    ) -> tuple[dict[str, _ResolvedSubagent], list[str]]:
         """Resolve every state's subagent reference; collect ALL failures.
 
         A string reference is a harness subagent entry id or title: its
@@ -2238,17 +2347,21 @@ class FactoryExecutor:
         its ``name`` (stripped the way the host strips spawn names) labels
         the spawned children.
         """
-        resolved: dict[str, tuple[str, str | None, str | None, str | None]] = {}
+        resolved: dict[str, _ResolvedSubagent] = {}
         errors: list[str] = []
         for state_spec in canonical["states"]:
             state_id = state_spec["id"]
             reference = state_spec["subagent"]
+            fork_from: Any = None
+            mcp_servers: Any = None
             if isinstance(reference, dict):
                 prompt = reference.get("prompt")
                 raw_name = reference.get("name")
                 name = raw_name.strip() if isinstance(raw_name, str) else None
                 model = reference.get("model")
                 thinking = reference.get("thinking")
+                fork_from = reference.get("fork_from")
+                mcp_servers = reference.get("mcp_servers")
             else:
                 entry = harness.get("subagent", reference)
                 if entry is None:
@@ -2268,14 +2381,21 @@ class FactoryExecutor:
             if settings_error is not None:
                 errors.append(f"state {state_id!r} {settings_error}")
                 continue
-            resolved[state_id] = (prompt, name or None, model, thinking)
+            resolved[state_id] = _ResolvedSubagent(
+                prompt=prompt,
+                name=name or None,
+                model=model,
+                thinking=thinking,
+                fork_from=fork_from,
+                mcp_servers=mcp_servers,
+            )
         return resolved, errors
 
     def _create_run(
         self,
         spec_id: str,
         canonical: dict[str, Any],
-        resolved: dict[str, tuple[str, str | None, str | None, str | None]],
+        resolved: dict[str, _ResolvedSubagent],
         *,
         name: str | None,
     ) -> FactoryRun:
@@ -2295,15 +2415,17 @@ class FactoryExecutor:
         for position, state_spec in enumerate(canonical["states"]):
             position_of[state_spec["id"]] = position
             state_id = state_spec["id"]
-            prompt, name, model, thinking = resolved.get(state_id, (None, None, None, None))
+            subagent = resolved.get(state_id)
             run.states[state_id] = _StateRun(
                 state_id=state_id,
                 spec=state_spec,
                 position=position,
-                prompt_template=prompt,
-                name=name,
-                model=model,
-                thinking=thinking,
+                prompt_template=subagent.prompt if subagent else None,
+                name=subagent.name if subagent else None,
+                model=subagent.model if subagent else None,
+                thinking=subagent.thinking if subagent else None,
+                fork_from=subagent.fork_from if subagent else None,
+                mcp_servers=subagent.mcp_servers if subagent else None,
                 max_entries=state_spec.get("max_entries", STATE_MAX_ENTRIES_DEFAULT),
             )
             run.order.append(state_id)
@@ -2736,10 +2858,37 @@ class FactoryExecutor:
                     return None, f"foreach.over input {name!r} is not a JSON list"
                 items = value
                 continue
-            values[name] = json.dumps(value)
+            # ``"verbatim": true`` renders a json STRING as text, the way a
+            # foreach item renders: a prompt that reads {directive} sees the
+            # words, not a quoted, escaped JSON literal. Everything else, and
+            # the default, renders as JSON.
+            if inp.get("verbatim") is True and isinstance(value, str):
+                values[name] = value
+            else:
+                values[name] = json.dumps(value)
+        # The spawn options bind from the same inputs as the prompt (one
+        # resolution per entry; foreach instances share it). A wrong shape
+        # is a deterministic binding failure, like a bad port.
+        fork_from, option_error = self._resolve_fork_from(state, values)
+        if option_error is not None:
+            return None, option_error
+        mcp_servers, option_error = self._resolve_mcp_servers(state, values)
+        if option_error is not None:
+            return None, option_error
+        # A hidden input binds (the spawn options read it) but never
+        # reaches the prompt: not as a placeholder, not in the trailing
+        # ``## Inputs`` section. The player of a checkpoint machine must not
+        # see the session paths, the restore handle, or a server token.
+        hidden = {inp["name"] for inp in state.spec.get("inputs") or [] if inp.get("hidden") is True}
+        visible = {name: value for name, value in values.items() if name not in hidden}
         if foreach is None:
             assert state.prompt_template is not None
-            instance = _NodeInstance(index=state.instance_counter, prompt=_render_prompt(state.prompt_template, values))
+            instance = _NodeInstance(
+                index=state.instance_counter,
+                prompt=_render_prompt(state.prompt_template, visible),
+                fork_from=fork_from,
+                mcp_servers=mcp_servers,
+            )
             state.instance_counter += 1
             return [instance], None
         if items is None:
@@ -2750,11 +2899,83 @@ class FactoryExecutor:
             instances.append(
                 _NodeInstance(
                     index=state.instance_counter + len(instances),
-                    prompt=_render_prompt(state.prompt_template, {**values, foreach["over"]: instance_value}),
+                    prompt=_render_prompt(state.prompt_template, {**visible, foreach["over"]: instance_value}),
+                    fork_from=fork_from,
+                    mcp_servers=mcp_servers,
                 )
             )
         state.instance_counter += len(instances)
         return instances, None
+
+    def _resolve_fork_from(self, state: _StateRun, values: dict[str, str]) -> "tuple[Any, str | None]":
+        """The entry's ``fork_from`` spawn kwarg, or ``(None, None)`` for a
+        fresh session.
+
+        ``"self"`` copies the session file of this state's latest settled
+        child; the first entry (no settle yet) and a settle whose child
+        reported no file start fresh. The input/path form reads a path
+        string or a ``{"session_file", "entry_id"}`` object from a bound json
+        input; ``null`` there starts fresh, anything else is a binding
+        failure.
+        """
+        spec = state.fork_from
+        if spec is None:
+            return None, None
+        # The spec's ``"kernel": false`` opts the fork out of the kernel copy;
+        # the host copies it by default, so only the opt-out rides the kwarg.
+        kernel = not (isinstance(spec, dict) and spec.get("kernel") is False)
+        if spec == "self" or (isinstance(spec, dict) and spec.get("self") is True):
+            latest = state.latest_settle()
+            if latest is None:
+                return None, None
+            for instance in reversed(latest.instances):
+                if instance.status == "done" and instance.session_file:
+                    if kernel:
+                        return instance.session_file, None
+                    return {"session_file": instance.session_file, "kernel": False}, None
+            return None, None
+        value, error = _spawn_option_value(spec, values, f"state {state.state_id!r} fork_from")
+        if error is not None or value is None:
+            return None, error
+        if isinstance(value, str) and value.strip():
+            return (value if kernel else {"session_file": value, "kernel": False}), None
+        if isinstance(value, dict):
+            session_file = value.get("session_file")
+            entry_id = value.get("entry_id")
+            bound_kernel = value.get("kernel")
+            if (
+                isinstance(session_file, str)
+                and session_file.strip()
+                and (entry_id is None or (isinstance(entry_id, str) and entry_id.strip()))
+                and (bound_kernel is None or isinstance(bound_kernel, bool))
+            ):
+                resolved: dict[str, Any] = {"session_file": session_file}
+                if entry_id is not None:
+                    resolved["entry_id"] = entry_id
+                if not kernel or bound_kernel is False:
+                    resolved["kernel"] = False
+                return resolved, None
+        return None, (
+            f"state {state.state_id!r} fork_from resolved to {type(value).__name__}; "
+            "expected a session file path or {session_file, entry_id, kernel}"
+        )
+
+    def _resolve_mcp_servers(self, state: _StateRun, values: dict[str, str]) -> "tuple[Any, str | None]":
+        """The entry's ``mcp_servers`` spawn kwarg (a list of server objects
+        read from a bound json input), or ``(None, None)`` when the spec
+        has none or the input holds ``null``."""
+        spec = state.mcp_servers
+        if spec is None:
+            return None, None
+        value, error = _spawn_option_value(spec, values, f"state {state.state_id!r} mcp_servers")
+        if error is not None or value is None:
+            return None, error
+        if isinstance(value, list) and all(isinstance(server, dict) for server in value):
+            return value, None
+        return None, (
+            f"state {state.state_id!r} mcp_servers resolved to {type(value).__name__}; "
+            "expected a list of server objects"
+        )
 
     def _next_pending_instance(self, run: FactoryRun) -> "tuple[_StateRun, _StateEntry, _NodeInstance] | None":
         # Pending instances are admitted ONLY for running entries: a foreach
@@ -2799,9 +3020,14 @@ class FactoryExecutor:
 
         instance.attempt += 1
         child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
+        spawn_kwargs: dict[str, Any] = {}
+        if instance.fork_from is not None:
+            spawn_kwargs["fork_from"] = instance.fork_from
+        if instance.mcp_servers is not None:
+            spawn_kwargs["mcp_servers"] = instance.mcp_servers
         try:
             handle = await spawn(
-                instance.prompt, name=child_name, model=state.model, thinking=state.thinking
+                instance.prompt, name=child_name, model=state.model, thinking=state.thinking, **spawn_kwargs
             )
         except RuntimeError as exc:
             last_error = str(exc)
@@ -2850,10 +3076,18 @@ class FactoryExecutor:
             await self._retract_admission(run, state, entry, instance)
             return "stopped"
         instance.child_id = handle.rlm_child_id
+        instance.session_file = str(handle.session_file) if handle.session_file else None
+        instance.forked_kernel = handle.forked_kernel
         instance.spawned_at = self._now_fn()
         instance.status = "running"
         instance.rate_limit_streak = 0
         run.spawn_count += 1
+        spawned_fields: dict[str, Any] = {}
+        if instance.fork_from is not None:
+            spawned_fields["forked_from"] = copy.deepcopy(instance.fork_from)
+            spawned_fields["forked_kernel"] = instance.forked_kernel
+        if instance.mcp_servers is not None:
+            spawned_fields["mcp_servers"] = [server.get("name") for server in instance.mcp_servers]
         self._event(
             run,
             "spawned",
@@ -2863,6 +3097,7 @@ class FactoryExecutor:
             attempt=instance.attempt,
             child=handle.rlm_child_id,
             name=child_name,
+            **spawned_fields,
         )
         return "admitted"
 
@@ -5021,7 +5256,11 @@ the cap, fails to capture, and fails the producing state through its
   `"from": "<state_id>.<output_name>"`; types must match, duplicates are
   rejected, and nothing can read from a resident. Bound values render into
   `{input_name}` placeholders (one pass; inputs without a placeholder are
-  appended in a trailing `## Inputs` section). A required input whose source
+  appended in a trailing `## Inputs` section). Two input flags shape the
+  rendering: `"verbatim": true` renders a json STRING as text (the way a
+  foreach item renders; the default is the JSON literal), and
+  `"hidden": true` binds the input (the spawn options can read it) but
+  never renders it, not as a placeholder and not in the trailing section. A required input whose source
   has not settled yet keeps the entry pending; over a settled source that
   offers no value (an errored settle, or a settle that captured nothing for
   the port) it fails the dependent entry, while
@@ -5056,6 +5295,23 @@ the cap, fails to capture, and fails the producing state through its
   entry, while an optional input over the failed source binds the null
   sentinel and the dependent proceeds. Under the default `escalate` the
   failure never propagates that far (see bounds and policies).
+- **Forked children** (inline subagent only): by default every child starts
+  with an empty conversation. `"fork_from": "self"` starts each re-entry's
+  child from a COPY of this state's latest settled child's session file, so
+  a looping state keeps its memory across rounds (the first entry starts
+  fresh). `"fork_from": {"input": "<json input>", "path": "<dotted.path>"}`
+  reads the source from a bound json input: a session file path, or
+  `{"session_file": ..., "entry_id": ...}` to copy only the branch up to that
+  entry; `null` there starts fresh. `"mcp_servers": {"input": ..., "path": ...}`
+  reads a list of session-scoped MCP server objects the same way and installs
+  them on the child before its task prompt (one game server per child, say).
+  Both options must name a `json` input of the state. A fork copies the
+  source's Python kernel too (its latest snapshot, even for an `entry_id`
+  cut), so names the source defined in `python_repl` exist in the child;
+  `"kernel": false` on the object form opts out, and
+  `{"self": true, "kernel": false}` is `"self"` without the kernel. The
+  spawned child's `session_file` rides the status instance rows, and the
+  `spawned` event carries `forked_from` and `forked_kernel`.
 - **Cycles are legal**: there is no acyclicity requirement — self-loops and
   back edges validate. The one rule is an entry state somewhere; a dag
   whose every node depends on another compiles to no entry states and is

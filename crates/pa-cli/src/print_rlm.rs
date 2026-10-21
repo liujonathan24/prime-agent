@@ -551,6 +551,14 @@ impl RlmSubagentHost for InlineHost {
             if node.depth >= node.max_depth {
                 return Err(rlm_depth_limit_error(node.depth, node.max_depth));
             }
+            // Inline children keep no session file to copy and share the
+            // parent's MCP connections, so neither option can be honored.
+            if request.fork_from.is_some() || request.mcp_servers.is_some() {
+                anyhow::bail!(
+                    "rlm.spawn fork_from and mcp_servers need the daemon; a --print \
+                     session's inline children cannot use them"
+                );
+            }
             let recipe = Arc::clone(&node.recipe);
             let config = &recipe.options.config;
             let child_id = format!("sub-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
@@ -770,6 +778,8 @@ impl RlmSubagentHost for InlineHost {
                 name,
                 session_dir: child_node.session_dir.clone(),
                 model: selector,
+                session_file: None,
+                forked_kernel: None,
             })
         })
     }
@@ -1186,11 +1196,14 @@ mod tests {
         Arc::get_mut(&mut node).unwrap().max_depth = 2;
         let gate = node.spawn_gate.lock().await;
         let mut spawn = InlineHost(Arc::clone(&node)).spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "finish the task".to_string(),
             name: Some("late".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         });
         std::future::poll_fn(|context| {
             assert!(spawn.as_mut().poll(context).is_pending());
@@ -1206,6 +1219,35 @@ mod tests {
         let error = result.expect_err("a disposed parent must not admit a queued spawn");
         assert!(error.to_string().contains("disposed"), "{error:#}");
         assert_eq!(admitted, 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_fork_from_and_mcp_servers_without_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = run_options(directory.path());
+        std::fs::create_dir_all(&options.config.agent_dir).unwrap();
+        let manager = pa_core::session::manager::SessionManager::in_memory(directory.path());
+        let mut node = root_node(&options, &manager, Some(json!({ "responses": ["parent"] })));
+        Arc::get_mut(&mut node).unwrap().max_depth = 2;
+        let error = InlineHost(Arc::clone(&node))
+            .spawn(RlmSpawnRequest {
+                parent_turn_in_flight: None,
+                prompt: "finish the task".to_string(),
+                name: None,
+                model: None,
+                thinking: None,
+                spawned_by_request_id: None,
+                fork_from: Some(pa_core::session_engine::rlm_host::ForkSource {
+                    session_file: "/archive/c1/player.jsonl".to_string(),
+                    entry_id: None,
+                    kernel: true,
+                }),
+                mcp_servers: Some(Vec::new()),
+            })
+            .await
+            .expect_err("an inline child cannot fork or take its own MCP servers");
+        assert!(error.to_string().contains("need the daemon"), "{error:#}");
+        assert_eq!(node.children.lock().await.len(), 0);
     }
 
     #[tokio::test]

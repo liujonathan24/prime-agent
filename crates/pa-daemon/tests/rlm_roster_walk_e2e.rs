@@ -354,11 +354,14 @@ async fn subscribe_after_spawn_then_shutdown_seeds_the_passive_child() {
     });
     let handle = children
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight: None,
             prompt: "ship the seed lane".to_string(),
             name: Some("worker-a".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         })
         .await
         .expect("spawn child");

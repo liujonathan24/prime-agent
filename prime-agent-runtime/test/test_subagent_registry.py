@@ -94,6 +94,44 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(result.name, "api-reviewer")
         self.assertEqual(result.model, "deepseek/deepseek-v4-flash")
 
+    def test_forwards_fork_from_and_mcp_servers_to_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "rlm_child_id": "sub-a1b2c3d4",
+                "name": "player",
+                "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                "model": "p/m",
+                "session_file": "/tmp/parent/sub-a1b2c3d4/sess.jsonl",
+                "forked_kernel": False,
+            }
+        )
+        servers = [{"type": "http", "name": "game", "url": "http://game.local/mcp", "headers": {}}]
+
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(
+                rlm_module.rlm.spawn(
+                    "resume the game",
+                    name="player",
+                    fork_from={"session_file": Path("/archive/c7.jsonl"), "entry_id": "e42", "kernel": False},
+                    mcp_servers=servers,
+                )
+            )
+            with self.assertRaises(TypeError):
+                asyncio.run(rlm_module.rlm.spawn("p", name="n", fork_from={"entry_id": "e1"}))
+        host_request.assert_awaited_once_with(
+            "rlm.run",
+            {
+                "prompt": "resume the game",
+                "kwargs": {
+                    "name": "player",
+                    "fork_from": {"session_file": "/archive/c7.jsonl", "entry_id": "e42", "kernel": False},
+                    "mcp_servers": servers,
+                },
+            },
+        )
+        self.assertEqual(result.session_file, Path("/tmp/parent/sub-a1b2c3d4/sess.jsonl"))
+        self.assertIs(result.forked_kernel, False)
+
     def test_requires_an_explicit_child_name(self) -> None:
         host_request = AsyncMock()
         with patch.object(rlm_module, "host_request", host_request):

@@ -2,6 +2,7 @@
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
 //! `collect`, `rename`) over the supervisor's child-sessions registry,
 //! with the spawn-admission helpers only this surface uses.
+use super::lifecycle::ChildSessionSource;
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
     resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
@@ -12,6 +13,8 @@ use super::{
     SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
     RENAME_TIMEOUT_MS,
 };
+use anyhow::anyhow;
+use pa_core::session_engine::rlm_host::ForkSource;
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
 /// the typed error and the `model refused` event; the settings read runs on the blocking pool.
@@ -81,6 +84,12 @@ impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
         Box::pin(async move {
+            // The turn boundary the kickoff waits for is the one current at
+            // admission (see `wait_turn_done`): read it before the first
+            // await, so a parent turn that ends while the child is being
+            // created (a fork's kernel copy, the worker launch) still
+            // releases the kickoff instead of leaving it for the next turn.
+            let turn_generation = *this.turn_done.subscribe().borrow();
             let identity = this.identity.lock().expect("identity lock").clone();
             if identity.rlm_depth >= identity.rlm_max_depth {
                 bail!(rlm_depth_limit_error(
@@ -122,6 +131,28 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
                 let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
+                // A forked child's copy is written before the worker exists,
+                // so a bad source fails the spawn with nothing to tear down.
+                let (session_source, forked_kernel) = match &request.fork_from {
+                    None => (ChildSessionSource::Fresh, None),
+                    Some(source) => {
+                        let forked =
+                            fork_child_session(source, Path::new(&cwd), &child_dir).await?;
+                        // The kernel snapshot lands in the copy's artifact
+                        // dir before the worker exists: its resume prewarm
+                        // revives the source's namespace.
+                        let kernel = if source.kernel {
+                            super::fork_kernel::copy_fork_kernel(
+                                Path::new(&source.session_file),
+                                &forked,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                        (ChildSessionSource::Forked(forked), Some(kernel))
+                    }
+                };
                 let runtime_metadata = json!({
                     "kind": "subagent",
                     "rlmChildId": child_id,
@@ -148,8 +179,28 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         // process, so the spawn forwards the parent
                         // worker's env (filtered) instead.
                         Some(pa_types::daemon::launch_env::collect_process_launch_env()),
+                        &session_source,
                     )
                     .await?;
+                // The child's own MCP servers go in before its task prompt
+                // (the worker refuses a replacement while the agent runs);
+                // a failed install tears the created session down like a
+                // failed prompt does.
+                if let Some(servers) = &request.mcp_servers {
+                    if let Err(error) = this
+                        .replace_child_mcp_servers(
+                            &created.active_session_id,
+                            &format!("rlm-spawn:{child_id}"),
+                            servers,
+                        )
+                        .await
+                    {
+                        let _ = this
+                            .kill_child(&created.active_session_id, ChildCloseReason::Killed)
+                            .await;
+                        return Err(error);
+                    }
+                }
                 let record = ChildRecord {
                     rlm_child_id: child_id.clone(),
                     session_name: created.session_name.clone().unwrap_or_else(|| name.clone()),
@@ -190,10 +241,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 this.children.lock().await.push(Arc::clone(&record));
                 this.refresh_running().await;
                 this.emit_child_update(&record).await;
-                anyhow::Ok((record, created, model))
+                anyhow::Ok((record, created, model, forked_kernel))
             }
             .await;
-            let (record, created, model) = admission?;
+            let (record, created, model, forked_kernel) = admission?;
             // The task prompt runs detached from the spawn admission: the
             // handle returns at registration and the child's first turn
             // starts after the parent's continuation request is in flight.
@@ -238,19 +289,33 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
-            // Capture the current turn boundary before detaching: spawn
-            // admission happens mid-turn, so the parent's continuation
-            // request reaches the provider first (see `wait_turn_done`).
-            let turn_generation = *this.turn_done.subscribe().borrow();
+            // A spawn from a tool call in the parent's turn waits for that
+            // turn to end, so the parent's continuation request reaches the
+            // provider first (see `wait_turn_done`). A spawn made while the
+            // parent is idle (a factory run's background task, after the
+            // parent ended its turn) has no turn to wait for: waiting would
+            // hold the kickoff until the parent's NEXT turn ends, or the
+            // full bound.
+            let wait_for_parent_turn = request.parent_turn_in_flight != Some(false);
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
+                if wait_for_parent_turn {
+                    watcher_this.wait_turn_done(turn_generation).await;
+                }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
                 if watcher_record.lock().await.closed_by_parent {
                     return;
                 }
-                watcher_record.lock().await.prompt_admitted = true;
+                // `prompt_admitted` flips only once the kickoff has been
+                // delivered (below): while the prompt is in flight — a
+                // routing retry, a durable wake that launches a fresh
+                // worker — the child's worker reads alive-but-idle, and
+                // `refresh_record` would score that as a `done` settle with
+                // the pre-prompt empty answer. Measured on a factory run:
+                // the parent's collect declared an orchestrator child done
+                // eight seconds before its first assistant turn, and the
+                // machine ended on an empty output capture.
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -295,6 +360,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         return;
                     }
                 }
+                watcher_record.lock().await.prompt_admitted = true;
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -302,6 +368,8 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 name,
                 session_dir: created.session_dir,
                 model,
+                session_file: created.session_file,
+                forked_kernel,
             })
         })
     }
@@ -744,4 +812,53 @@ fn session_file_carries_spawn_kickoff(session_file: Option<&str>, spawn_row_id: 
                     == Some(pa_core::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE)
                 && entry.pointer("/details/id").and_then(Value::as_str) == Some(spawn_row_id)
         })
+}
+
+/// Write the fork source's copy into `child_dir` off the executor (both
+/// copies are synchronous file I/O): the whole file through
+/// `SessionManager::fork_from`, or the branch up to `entry_id` through
+/// `SessionFile::create_branched_file`. The copy records the parent's cwd
+/// and carries the source path as `parentSession`; `rlmDepth` is set by
+/// the create config, not the copied header.
+async fn fork_child_session(
+    source: &ForkSource,
+    cwd: &Path,
+    child_dir: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let source = source.clone();
+    let cwd = cwd.to_path_buf();
+    let child_dir = child_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<std::path::PathBuf> {
+        let session_file = Path::new(&source.session_file);
+        if !session_file.is_file() {
+            bail!(
+                "fork_from session file does not exist: {}",
+                session_file.display()
+            );
+        }
+        match &source.entry_id {
+            None => {
+                let forked = pa_core::session::manager::SessionManager::fork_from(
+                    session_file,
+                    &cwd,
+                    &child_dir,
+                )
+                .map_err(anyhow::Error::msg)?;
+                forked
+                    .get_session_file()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| anyhow!("forked session has no session file"))
+            }
+            Some(entry_id) => {
+                let store = crate::session_store::SessionFile::open(session_file)
+                    .with_context(|| format!("open fork source {}", session_file.display()))?;
+                let forked = store
+                    .create_branched_file(entry_id, &child_dir)
+                    .with_context(|| format!("fork at entry {entry_id}"))?;
+                Ok(forked.path)
+            }
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)?
 }

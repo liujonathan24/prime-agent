@@ -156,11 +156,14 @@ async fn sessions_with_gated_supervisor(
 
 fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
     RlmSpawnRequest {
+        parent_turn_in_flight: None,
         prompt: prompt.to_string(),
         name: Some(name.to_string()),
         model: None,
         thinking: None,
         spawned_by_request_id: None,
+        fork_from: None,
+        mcp_servers: None,
     }
 }
 

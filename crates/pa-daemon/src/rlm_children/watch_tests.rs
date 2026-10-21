@@ -355,13 +355,24 @@ async fn sessions_with_fake_child_subagents(
 }
 
 async fn spawn_child(sessions: &SupervisorChildSessions) -> RlmSpawnHandle {
+    spawn_child_with_parent_turn(sessions, None).await
+}
+
+/// [`spawn_child`] with the parent's turn state at admission.
+async fn spawn_child_with_parent_turn(
+    sessions: &SupervisorChildSessions,
+    parent_turn_in_flight: Option<bool>,
+) -> RlmSpawnHandle {
     sessions
         .spawn(RlmSpawnRequest {
+            parent_turn_in_flight,
             prompt: "f20 child task".to_string(),
             name: Some("f20-worker".to_string()),
             model: None,
             thinking: None,
             spawned_by_request_id: None,
+            fork_from: None,
+            mcp_servers: None,
         })
         .await
         .expect("spawn must succeed against the fake supervisor")
@@ -728,6 +739,52 @@ async fn a_settled_child_without_a_reply_delivers_the_terminal_notice() {
     let extra =
         tokio::time::timeout(std::time::Duration::from_millis(300), follow_up_rx.recv()).await;
     assert!(extra.is_err(), "no second notice may arrive");
+}
+
+/// A spawn made while the parent is idle (a factory run's background task,
+/// after the parent ended its turn) gets no turn boundary: its kickoff must
+/// not wait for the parent's next turn or the 60 s bound.
+#[tokio::test]
+async fn a_spawn_while_the_parent_is_idle_starts_without_a_turn_boundary() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    spawn_child_with_parent_turn(&sessions, Some(false)).await;
+
+    // No `notify_turn_done`: the child runs and settles on its own.
+    let follow_up = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
+        .await
+        .expect("the kickoff of an idle parent's spawn must not wait for a turn boundary")
+        .expect("the follow_up channel stays open");
+    assert_eq!(
+        follow_up["customMessage"]["customType"],
+        "rlm_child_terminal_notice"
+    );
+}
+
+/// A spawn from a tool call in the parent's turn still waits for that turn
+/// to end, so the parent's continuation request reaches the provider first.
+#[tokio::test]
+async fn a_spawn_in_the_parents_turn_waits_for_the_turn_boundary() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    spawn_child_with_parent_turn(&sessions, Some(true)).await;
+
+    let early = tokio::time::timeout(Duration::from_secs(2), follow_up_rx.recv()).await;
+    assert!(
+        early.is_err(),
+        "the kickoff waits for the parent's turn to end"
+    );
+    sessions.notify_turn_done();
+    let follow_up = tokio::time::timeout(Duration::from_secs(10), follow_up_rx.recv())
+        .await
+        .expect("the turn boundary releases the kickoff")
+        .expect("the follow_up channel stays open");
+    assert_eq!(
+        follow_up["customMessage"]["customType"],
+        "rlm_child_terminal_notice"
+    );
 }
 
 /// The settle grace re-marks only a BUSY child as running: a worker that

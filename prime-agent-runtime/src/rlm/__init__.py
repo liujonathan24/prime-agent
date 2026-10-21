@@ -30,6 +30,11 @@ class RLMSpawnHandle:
     name: str
     session_dir: Path
     model: str
+    #: The child's session file when the host reports one (a persisted child);
+    #: ``fork_from`` on a later spawn names it.
+    session_file: Path | None = None
+    #: A forked spawn only: whether the source's kernel snapshot was copied.
+    forked_kernel: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -114,11 +119,15 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     model = payload.get("model")
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
         raise RuntimeError("rlm.spawn returned an invalid spawn handle")
+    session_file = payload.get("session_file")
+    forked_kernel = payload.get("forked_kernel")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
         model=model,
+        session_file=Path(session_file) if isinstance(session_file, str) and session_file else None,
+        forked_kernel=forked_kernel if isinstance(forked_kernel, bool) else None,
     )
 
 
@@ -176,12 +185,43 @@ def emit(data: dict[str, Any]) -> None:
     repl.emit(data)
 
 
+def _fork_from_kwarg(fork_from: str | Path | dict[str, Any]) -> dict[str, Any]:
+    """Normalize ``fork_from`` to the wire object ``{"session_file", "entry_id"?, "kernel"?}``."""
+    if isinstance(fork_from, Path):
+        fork_from = str(fork_from)
+    if isinstance(fork_from, str):
+        if not fork_from.strip():
+            raise TypeError("fork_from must be a non-empty session file path")
+        return {"session_file": fork_from}
+    if isinstance(fork_from, dict):
+        session_file = fork_from.get("session_file")
+        if isinstance(session_file, Path):
+            session_file = str(session_file)
+        if not isinstance(session_file, str) or not session_file.strip():
+            raise TypeError("fork_from.session_file must be a non-empty path")
+        entry_id = fork_from.get("entry_id")
+        if entry_id is not None and (not isinstance(entry_id, str) or not entry_id.strip()):
+            raise TypeError("fork_from.entry_id must be a non-empty string when given")
+        kernel = fork_from.get("kernel")
+        if kernel is not None and not isinstance(kernel, bool):
+            raise TypeError("fork_from.kernel must be a bool when given")
+        wire: dict[str, Any] = {"session_file": session_file}
+        if entry_id is not None:
+            wire["entry_id"] = entry_id
+        if kernel is not None:
+            wire["kernel"] = kernel
+        return wire
+    raise TypeError(f"fork_from must be a path or a dict, got {type(fork_from).__name__}")
+
+
 async def spawn(
     prompt: str,
     *,
     name: str,
     model: str | None = None,
     thinking: str | None = None,
+    fork_from: str | Path | dict[str, Any] | None = None,
+    mcp_servers: list[dict[str, Any]] | None = None,
 ) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
@@ -189,6 +229,19 @@ async def spawn(
     ``model`` selects a child with an exact ``provider/model`` selector.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
+    ``fork_from`` starts the child from a COPY of an existing session file instead
+    of an empty one: a path copies the whole file, and
+    ``{"session_file": path, "entry_id": id}`` copies the branch up to that entry.
+    The child then reads its ``[task from parent]`` prompt on top of the copied
+    conversation. The source's Python kernel comes too: its latest snapshot is
+    copied, so names the source defined in ``python_repl`` exist in the child
+    (``"kernel": False`` in the dict form opts out; a fork cut at ``entry_id``
+    still gets the source's LATEST kernel). The source must belong to a settled
+    child (or a session no worker holds); the copy never touches the source.
+    ``mcp_servers`` gives the child its own session-scoped MCP servers (the same
+    objects ``replace_acp_mcp_servers`` takes: ``{"type": "http", "name", "url",
+    "headers"}`` or ``{"type": "stdio", "name", "command", "args", "cwd", "env"}``);
+    they shadow the parent's servers of the same name for that child only.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
@@ -197,6 +250,12 @@ async def spawn(
         kwargs["model"] = model
     if thinking is not None:
         kwargs["thinking"] = thinking
+    if fork_from is not None:
+        kwargs["fork_from"] = _fork_from_kwarg(fork_from)
+    if mcp_servers is not None:
+        if not isinstance(mcp_servers, list) or not all(isinstance(server, dict) for server in mcp_servers):
+            raise TypeError("mcp_servers must be a list of server objects")
+        kwargs["mcp_servers"] = mcp_servers
     # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
@@ -639,8 +698,17 @@ class _RLMNamespace:
         name: str,
         model: str | None = None,
         thinking: str | None = None,
+            fork_from: str | Path | dict[str, Any] | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
     ) -> RLMSpawnHandle:
-        return await spawn(prompt, name=name, model=model, thinking=thinking)
+        return await spawn(
+            prompt,
+            name=name,
+            model=model,
+            thinking=thinking,
+            fork_from=fork_from,
+            mcp_servers=mcp_servers,
+        )
 
     async def create_session(
         self,

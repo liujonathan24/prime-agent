@@ -1074,6 +1074,7 @@ impl SupervisorChildSessionsInner {
     }
 }
 
+mod fork_kernel;
 mod host;
 mod lifecycle;
 mod registry;
